@@ -1,37 +1,49 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
+#include <ranges>
 #include <string>
+#include <vector>
 
-enum class IpProtocol {
+enum class IpProtocol
+{
     IPv4,
     IPv6
 };
 
-namespace Util {
+namespace Util
+{
 
-// Helper to convert array of chars to hex
-template <size_t N> static std::string toHex(const std::array<char, N> &bytes) {
-  std::string hex;
-  const char hexChars[] = "0123456789abcdef";
-  for (char b : bytes) {
-    unsigned char ub = static_cast<unsigned char>(b);
-    hex += hexChars[(ub >> 4) & 0x0F];
-    hex += hexChars[ub & 0x0F];
-  }
-  return hex;
+template <typename T>
+concept ByteRange = std::ranges::input_range<T> && sizeof(std::ranges::range_value_t<T>) == 1;
+
+template <ByteRange T> static std::string toHex(const T &bytes)
+{
+    std::string hex;
+    const char hexChars[] = "0123456789abcdef";
+    for (auto b : bytes)
+    {
+        unsigned char ub = static_cast<unsigned char>(b);
+        hex += hexChars[(ub >> 4) & 0x0F];
+        hex += hexChars[ub & 0x0F];
+    }
+    return hex;
 }
 
-static std::string toHex(const std::string &bytes) {
-  std::string hex;
-  const char hexChars[] = "0123456789abcdef";
-  for (char b : bytes) {
-    unsigned char ub = static_cast<unsigned char>(b);
-    hex += hexChars[(ub >> 4) & 0x0F];
-    hex += hexChars[ub & 0x0F];
-  }
-  return hex;
+static std::vector<unsigned char> fromHex(const std::string &hex)
+{
+    std::vector<unsigned char> bytes;
+    if (hex.length() % 2 != 0)
+    {
+        return bytes;
+    }
+    for (size_t i = 0; i < hex.length(); i += 2)
+    {
+        std::string byteString = hex.substr(i, 2);
+        unsigned char byte = static_cast<unsigned char>(strtol(byteString.c_str(), nullptr, 16));
+        bytes.push_back(byte);
+    }
+    return bytes;
 }
 
-}
+} // namespace Util

@@ -2,10 +2,11 @@
 
 #include <libtorrent/alert.hpp>
 
-class AlertObserver {
-public:
-  AlertObserver() = default;
-  ~AlertObserver() = default;
+class AlertObserver
+{
+  public:
+    AlertObserver() = default;
+    virtual ~AlertObserver() = default;
 
-  virtual void onAlert(lt::alert *alert) = 0;
+    virtual void onAlert(lt::alert *alert) = 0;
 };

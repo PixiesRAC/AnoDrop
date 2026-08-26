@@ -1,6 +1,9 @@
 #pragma once
 
-class Logger {
-public:
-  static void init();
+#include <string>
+
+class Logger
+{
+  public:
+    static void init(const std::string &logPath = "anodrop.log");
 };

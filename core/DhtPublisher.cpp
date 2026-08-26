@@ -1,47 +1,67 @@
 #include "core/DhtPublisher.h"
-#include "crypto/HandShakeChannel.h"
+#include "core/HandshakeManager.h"
 #include "crypto/Hasher.h"
+#include "network/DhtManager.h"
 #include "network/Dropper.h"
-#include "utils/Util.h"
 
 #include <libtorrent/hasher.hpp>
+#include <nlohmann/json.hpp>
+#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #include <spdlog/spdlog.h>
 
-void DhtPublisher::setDhtManager(std::unique_ptr<DhtManager> dhtManager) {
-  m_dhtManager = std::move(dhtManager);
+void DhtPublisher::setDhtManager(std::unique_ptr<DhtManager> dhtManager)
+{
+    m_dhtManager = std::move(dhtManager);
 }
 
-DhtPublisher::RendezvousInfo DhtPublisher::initializeRendezvous(const std::string& passphrase) {
-  std::vector<unsigned char> seed = Hasher::getInstance().getHashedMsg(passphrase);
-  
-  HandShakeChannel channel(seed);
-  m_pubKey = channel.getPublicKey();
-  m_privKey = channel.getPrivateKey();
-
-  lt::hasher h(m_pubKey.data(), m_pubKey.size());
-  lt::sha1_hash targetID = h.final();
-
-  DhtPublisher::RendezvousInfo info;
-  info.pubKeyHex = Util::toHex(m_pubKey);
-  info.targetIDHex = Util::toHex(targetID.to_string());
-
-  spdlog::info("Public Key (Hex): {}", info.pubKeyHex);
-  spdlog::info("Target ID (SHA-1): {}", info.targetIDHex);
-
-  return info;
+void DhtPublisher::setLobbyStore(std::shared_ptr<LobbyStore> lobbyStore)
+{
+    m_lobbyStore = lobbyStore;
 }
 
-void DhtPublisher::dispatchMessage(const std::string& message) {
-  if (!m_dhtManager) {
-    throw std::runtime_error("DHT Manager is not initialized");
-  }
+HandshakeManager::ChannelKeys DhtPublisher::deriveChannelKeys(const std::string &passphrase)
+{
+    std::vector<unsigned char> seed = Hasher::getInstance().getHashMsg256(passphrase);
+    HandshakeManager::ChannelKeys info(seed);
 
-  Dropper dropper(m_dhtManager->getSession(), m_pubKey, m_privKey);
-  dropper.dropMessage(message);
+    SPDLOG_INFO("Public Key (Hex): {}", info.pubKeyHex);
+    SPDLOG_INFO("Target ID (SHA-1): {}", info.targetIDHex);
+
+    return info;
 }
 
-void DhtPublisher::waitForPutConfirmed() {
-  if (m_dhtManager) {
-    m_dhtManager->waitForPutConfirmed();
-  }
+void DhtPublisher::dispatchHandshakeMessage(const std::string &lobbyName, const std::string &pseudo)
+{
+    if (!m_dhtManager)
+    {
+        throw std::runtime_error("DHT Manager is not initialized");
+    }
+    if (!m_lobbyStore)
+    {
+        throw std::runtime_error("Lobby Store is not initialized");
+    }
+
+    auto ciphertextOpt = DhtManager::prepareLobbyPayload(m_lobbyStore, lobbyName, pseudo);
+    if (!ciphertextOpt)
+    {
+        SPDLOG_WARN("Skipping handshake dispatch: could not prepare payload for lobby {}", lobbyName);
+        return;
+    }
+    const auto &ciphertext = *ciphertextOpt;
+
+    std::string encryptedMessage(ciphertext.begin(), ciphertext.end());
+
+    std::vector<unsigned char> seed = Hasher::getInstance().getHashMsg256(lobbyName);
+    HandshakeManager::ChannelKeys info(seed);
+
+    Dropper dropper(m_dhtManager->getSession(), info.publicKey, info.privateKey);
+    dropper.dropMessage(encryptedMessage, lobbyName, m_lobbyStore);
+}
+
+void DhtPublisher::waitForPutConfirmed(const std::string &lobbyName)
+{
+    if (m_dhtManager)
+    {
+        m_dhtManager->waitForPutConfirmed(lobbyName);
+    }
 }
