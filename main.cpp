@@ -8,13 +8,13 @@
 #include "utils/Logger.h"
 
 #include <memory>
-#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #include <spdlog/spdlog.h>
 
 #include "core/Config.h"
 
 #include <iostream>
 
+// TODO MAYBE : RESYNCHRO EMPTY BASE
 int main(int argc, char *argv[])
 {
     for (int i = 1; i < argc; ++i)
@@ -34,7 +34,7 @@ int main(int argc, char *argv[])
     }
 
     Config config(argc, argv);
-    Logger::init(config.getLogPath());
+    Logger::init(config.getLogPath(), config.getLogLevel());
     Hasher::getInstance().setConfig(config);
     const std::string storePath = config.getStorePath();
 
@@ -44,14 +44,15 @@ int main(int argc, char *argv[])
 
     std::shared_ptr<LobbyStore> lobbyStore = std::make_shared<LobbyStore>(masterPwd, storePath);
     std::unique_ptr<DhtManager> dhtManager = std::make_unique<DhtManager>();
+    dhtManager->setLobbyStore(lobbyStore);
     std::shared_ptr<DhtPublisher> dhtPublisher = std::make_shared<DhtPublisher>();
+    dhtPublisher->setMaxConcurrentFetches(config.getMaxConcurrentFetches());
 
     if (dhtManager->isSessionReady())
     {
         dhtManager->startAlertThread();
         dhtManager->waitUntilDhtIsReady();
         dhtPublisher->setDhtManager(std::move(dhtManager));
-        dhtPublisher->setLobbyStore(lobbyStore);
         gui.setDhtPublisher(dhtPublisher);
         gui.setLobbyStore(lobbyStore);
         gui.setAppFacade(std::make_unique<AppFacade>(dhtPublisher, lobbyStore));

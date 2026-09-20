@@ -4,7 +4,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
-void Logger::init(const std::string &logPath)
+void Logger::init(const std::string &logPath, const std::string &logLevelStr)
 {
     try
     {
@@ -20,8 +20,14 @@ void Logger::init(const std::string &logPath)
         std::string pattern = "\033[36m[%Y-%m-%d %H:%M:%S.%e]\033[0m \033[33m[" + base_filename + "]\033[0m \033[35m[%s:%#] [%!]\033[0m \033[32m[%l]\033[0m %v";
         spdlog::set_pattern(pattern);
 
-        spdlog::set_level(spdlog::level::info);
-        spdlog::flush_on(spdlog::level::info);
+        spdlog::level::level_enum lvl = spdlog::level::info;
+        if (logLevelStr == "trace") lvl = spdlog::level::trace;
+        else if (logLevelStr == "debug") lvl = spdlog::level::debug;
+        else if (logLevelStr == "warn") lvl = spdlog::level::warn;
+        else if (logLevelStr == "error") lvl = spdlog::level::err;
+
+        spdlog::set_level(lvl);
+        spdlog::flush_on(lvl);
         SPDLOG_INFO("Logger initialized. AnoDrop starting.");
     }
     catch (const spdlog::spdlog_ex &ex)

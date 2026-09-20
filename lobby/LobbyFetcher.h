@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <chrono>
 
 class LobbyFetcher
 {
@@ -25,4 +27,6 @@ class LobbyFetcher
     int m_fetchInterval;
     std::jthread m_fetchThread;
     std::shared_ptr<DhtPublisher> m_dhtPublisher;
+
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_lastHandshakePoll;
 };

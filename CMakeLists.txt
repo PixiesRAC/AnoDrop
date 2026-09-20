@@ -6,11 +6,24 @@ endif()
 
 project(AnoDrop VERSION 0.1.0 LANGUAGES CXX)
 
-# Always compile in debug mode
-set(CMAKE_BUILD_TYPE Debug CACHE STRING "Choose the type of build." FORCE)
+# Default to Debug if not specified
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Debug CACHE STRING "Choose the type of build.")
+endif()
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
+
+add_compile_options(
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wshadow
+    -Wconversion
+    -Wnon-virtual-dtor
+)
 
 find_package(Curses REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -32,11 +45,22 @@ add_executable(AnoDrop
     ui/GuiBuilder.cpp
     network/DhtManager.cpp
     utils/Logger.cpp
+    utils/WorkerThread.cpp
     network/AlertListener.cpp
     ui/Unlock.cpp
-    core/HandshakeManager.cpp
+    crypto/HandshakeKeyService.cpp
+    crypto/HandshakePayloadCodec.cpp
+    lobby/HandshakeStateEngine.cpp
+    ui/HandshakeView.cpp
+    ui/ChangePasswordView.cpp
+    ui/LobbiesView.cpp
+    ui/ChatView.cpp
     ui/GuiPreferences.cpp
+    ui/AnomalyFlagView.cpp
     core/AppFacade.cpp
+    chat/DhtChat.cpp
+    chat/DhtChatHandler.cpp
+    chat/ChatResyncer.cpp
 )
 
 target_link_libraries(AnoDrop
@@ -58,6 +82,7 @@ add_executable(decrypt_store
     lobby/LobbyListener.cpp
     lobby/Lobby.cpp
     crypto/CryptoUtils.cpp
+    utils/WorkerThread.cpp
 )
 
 target_link_libraries(decrypt_store
@@ -85,13 +110,16 @@ enable_testing()
 add_executable(test_crypto
     tests/test_crypto.cpp
     crypto/CryptoUtils.cpp
-    core/HandshakeManager.cpp
+    crypto/HandshakeKeyService.cpp
+    crypto/HandshakePayloadCodec.cpp
+    lobby/HandshakeStateEngine.cpp
     network/DhtManager.cpp
     network/AlertListener.cpp
     lobby/LobbyStore.cpp
     lobby/LobbyListener.cpp
     lobby/Lobby.cpp
     core/Config.cpp
+    utils/WorkerThread.cpp
 )
 
 target_link_libraries(test_crypto

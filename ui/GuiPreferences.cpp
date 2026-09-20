@@ -28,7 +28,7 @@ void GuiPreferences::load(const std::vector<LobbyData> &lobbies, std::vector<int
             {
                 if (lobbies[i].my_x25519_pub == savedPubKey)
                 {
-                    openChats.push_back(i);
+                    openChats.push_back(static_cast<int>(i));
                     break;
                 }
             }

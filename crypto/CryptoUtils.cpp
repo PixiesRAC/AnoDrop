@@ -4,7 +4,6 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <stdexcept>
-#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #include "lobby/LobbyData.h"
 #include "lobby/LobbyStore.h"
 #include "crypto/Hasher.h"
@@ -30,7 +29,7 @@ std::expected<std::vector<unsigned char>, std::string> encryptAES256GCM(const st
         return std::unexpected("Failed to create EVP_CIPHER_CTX");
 
     std::vector<unsigned char> iv(12);
-    if (RAND_bytes(iv.data(), iv.size()) != 1)
+    if (RAND_bytes(iv.data(), static_cast<int>(iv.size())) != 1)
     {
         return std::unexpected("Failed to generate random IV");
     }
@@ -49,7 +48,7 @@ std::expected<std::vector<unsigned char>, std::string> encryptAES256GCM(const st
     int len = 0;
     int ciphertext_len = 0;
 
-    if (EVP_EncryptUpdate(ctx.get(), ciphertext.data(), &len, plaintext.data(), plaintext.size()) != 1)
+    if (EVP_EncryptUpdate(ctx.get(), ciphertext.data(), &len, plaintext.data(), static_cast<int>(plaintext.size())) != 1)
     {
         return std::unexpected("Failed to encrypt data");
     }
@@ -110,7 +109,7 @@ std::expected<std::vector<unsigned char>, std::string> decryptAES256GCM(const st
     int len = 0;
     int plaintext_len = 0;
 
-    if (EVP_DecryptUpdate(ctx.get(), plaintext.data(), &len, ciphertext.data(), ciphertext.size()) != 1)
+    if (EVP_DecryptUpdate(ctx.get(), plaintext.data(), &len, ciphertext.data(), static_cast<int>(ciphertext.size())) != 1)
     {
         return std::unexpected("Failed to decrypt data");
     }

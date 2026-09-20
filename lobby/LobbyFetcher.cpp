@@ -1,10 +1,9 @@
 #include "lobby/LobbyFetcher.h"
 #include <chrono>
 #include <random>
-#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #include <spdlog/spdlog.h>
 
-LobbyFetcher::LobbyFetcher(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore, int fetchInterval) : m_dhtPublisher(dhtPublisher), m_lobbyStore(lobbyStore), m_fetchInterval(fetchInterval)
+LobbyFetcher::LobbyFetcher(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore, int fetchInterval) : m_lobbyStore(lobbyStore), m_fetchInterval(fetchInterval), m_dhtPublisher(dhtPublisher)
 {
 }
 
@@ -60,16 +59,28 @@ void LobbyFetcher::processLobby(std::string lobbyName)
         return;
     }
     LobbyData currentLobby = observer->getLobbyData();
+    if (currentLobby.is_hidden)
+    {
+        return;
+    }
+    
     switch (currentLobby.status)
     {
     case LobbyStatus::PENDING_HANDSHAKE:
-        SPDLOG_INFO("Lobby {} is PENDING_HANDSHAKE - Processing hand", currentLobby.lobby_name);
         m_dhtPublisher->dispatchHandshakeMessage(lobbyName, currentLobby.my_pseudo);
         m_dhtPublisher->waitForPutConfirmed(currentLobby.lobby_name);
         break;
     case LobbyStatus::HANDSHAKE_DONE:
-        SPDLOG_INFO("Lobby {} is HANDSHAKE_DONE - Placeholder", currentLobby.lobby_name);
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (m_lastHandshakePoll.find(lobbyName) == m_lastHandshakePoll.end() ||
+            std::chrono::duration_cast<std::chrono::seconds>(now - m_lastHandshakePoll[lobbyName]).count() >= 30)
+        {
+            m_lastHandshakePoll[lobbyName] = now;
+            m_dhtPublisher->checkLobbyAnomaly(lobbyName, m_lobbyStore);
+        }
         break;
+    }
     case LobbyStatus::ANOMALY:
         SPDLOG_WARN("Lobby {} has an ANOMALY - Placeholder", currentLobby.lobby_name);
         break;

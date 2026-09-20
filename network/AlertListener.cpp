@@ -1,6 +1,5 @@
 #include "network/AlertListener.h"
 #include <algorithm>
-#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #include <spdlog/spdlog.h>
 
 AlertListener::AlertListener(std::shared_ptr<lt::session> session) : m_session(std::move(session))

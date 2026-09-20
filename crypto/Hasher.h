@@ -88,6 +88,10 @@ class Hasher
         uint32_t iterations = m_config ? static_cast<uint32_t>(m_config->getArgon2Iterations()) : defaultIterations;
 
         SaltParams params{};
+        if (m_config)
+        {
+            params.extraValue = m_config->getExtraSaltDataForLobbyHandshake();
+        }
         std::vector<uint8_t> argon2Salt = params.serialize();
 
         constexpr uint32_t memoryCost = 1 << 16;

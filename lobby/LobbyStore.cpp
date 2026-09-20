@@ -3,11 +3,12 @@
 #include "crypto/CryptoUtils.h"
 #include "crypto/Hasher.h"
 #include "utils/Util.h"
+#include <openssl/crypto.h>
 
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <ranges>
-#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 
@@ -23,13 +24,22 @@ LobbyStore::LobbyStore(const std::string &masterPassword, const std::string &sto
     populateLobbies();
 }
 
-std::expected<void, std::string> LobbyStore::saveLobbyData(const LobbyData &data)
+LobbyStore::~LobbyStore()
 {
+    if (!m_masterKey.empty()) {
+        OPENSSL_cleanse(m_masterKey.data(), m_masterKey.capacity());
+    }
+}
+
+std::expected<void, StoreError> LobbyStore::saveLobbyData(const LobbyData &data)
+{
+    std::lock_guard<std::mutex> lock(m_saveMutex);
     std::string filename = Util::toHex(Hasher::getInstance().getHashMsg256(data.lobby_name)) + ".enc";
     std::filesystem::path filePath = std::filesystem::path(m_storeDir) / "lobbies" / filename;
     std::filesystem::path tmpPath = filePath.string() + ".tmp";
 
     nlohmann::json dataToSave = data;
+    dataToSave.erase("history"); // Exclude history from the main file
     std::string jsonStr = dataToSave.dump();
     std::vector<unsigned char> plaintext(jsonStr.begin(), jsonStr.end());
 
@@ -38,16 +48,19 @@ std::expected<void, std::string> LobbyStore::saveLobbyData(const LobbyData &data
         auto ciphertextRes = CryptoUtils::encryptAES256GCM(plaintext, m_masterKey);
         if (!ciphertextRes)
         {
-            return std::unexpected("Failed to encrypt data: " + ciphertextRes.error());
+            return std::unexpected(StoreError::EncryptionFailed);
         }
         std::vector<unsigned char> ciphertext = *ciphertextRes;
 
         std::ofstream outFile(tmpPath, std::ios::binary);
         if (!outFile)
         {
-            return std::unexpected("Failed to open temp file for writing: " + tmpPath.string());
+            return std::unexpected(StoreError::FileOpenFailed);
         }
-        outFile.write(reinterpret_cast<const char *>(ciphertext.data()), ciphertext.size());
+        if (!outFile.write(reinterpret_cast<const char *>(ciphertext.data()), ciphertext.size()))
+        {
+            return std::unexpected(StoreError::WriteFailed);
+        }
         outFile.close(); // Important to close before renaming
 
         // Atomic rename by the OS
@@ -63,7 +76,7 @@ std::expected<void, std::string> LobbyStore::saveLobbyData(const LobbyData &data
         {
             std::filesystem::remove(tmpPath); // Cleanup in case of error
         }
-        return std::unexpected(e.what());
+        return std::unexpected(StoreError::Unknown);
     }
 
     if (m_lobbyListener->hasAlreadyObserver(data.lobby_name))
@@ -73,21 +86,123 @@ std::expected<void, std::string> LobbyStore::saveLobbyData(const LobbyData &data
     return {};
 }
 
+std::expected<void, StoreError> LobbyStore::appendHistory(const std::string &lobbyName, const std::vector<ChatMessage> &newMessages)
+{
+    if (newMessages.empty())
+        return {};
+
+    std::lock_guard<std::mutex> lock(m_saveMutex);
+    std::string filename = Util::toHex(Hasher::getInstance().getHashMsg256(lobbyName)) + ".history.enc";
+    std::filesystem::path filePath = std::filesystem::path(m_storeDir) / "lobbies" / filename;
+
+    std::ofstream outFile(filePath, std::ios::binary | std::ios::app);
+    if (!outFile)
+    {
+        return std::unexpected(StoreError::FileOpenFailed);
+    }
+
+    try
+    {
+        for (const auto &msg : newMessages)
+        {
+            nlohmann::json j = msg;
+            std::string jsonStr = j.dump();
+
+            // Obfuscate message length: pad with spaces to a multiple of 256 bytes
+            size_t blockSize = 256;
+            size_t padding = blockSize - (jsonStr.size() % blockSize);
+            if (padding != blockSize)
+            {
+                jsonStr.append(padding, ' ');
+            }
+
+            std::vector<unsigned char> plaintext(jsonStr.begin(), jsonStr.end());
+
+            auto ciphertextRes = CryptoUtils::encryptAES256GCM(plaintext, m_masterKey);
+            if (!ciphertextRes)
+            {
+                return std::unexpected(StoreError::EncryptionFailed);
+            }
+            const auto &ciphertext = *ciphertextRes;
+
+            uint32_t size = static_cast<uint32_t>(ciphertext.size());
+            if (!outFile.write(reinterpret_cast<const char *>(&size), sizeof(size)) || !outFile.write(reinterpret_cast<const char *>(ciphertext.data()), ciphertext.size()))
+            {
+                return std::unexpected(StoreError::WriteFailed);
+            }
+        }
+        return {};
+    }
+    catch (const std::exception &e)
+    {
+        return std::unexpected(StoreError::Unknown);
+    }
+}
+
+void LobbyStore::asyncUpdateLobbyData(const std::string &lobbyName, const nlohmann::json &jsonPatch)
+{
+    m_ioWorker.enqueue([this, lobbyName, jsonPatch]() {
+        this->updateLobbyData(lobbyName, jsonPatch);
+    });
+}
+
 void LobbyStore::updateLobbyData(const std::string &lobbyName, const nlohmann::json &jsonPatch)
 {
-    SPDLOG_INFO("updateLobbyData for lobby {}: {}", lobbyName, jsonPatch.dump());
+    nlohmann::json logPatch = jsonPatch;
+    if (logPatch.contains("history"))
+    {
+        logPatch["history"] = "[history updated]";
+    }
+    SPDLOG_DEBUG("updateLobbyData for lobby {}: {}", lobbyName, logPatch.dump());
 
     auto observer = getOrCreateLobby(lobbyName);
 
+    bool metadataChanged = false;
+    for (auto it = jsonPatch.begin(); it != jsonPatch.end(); ++it)
+    {
+        if (it.key() == "new_message")
+        {
+            auto msg = it.value().get<ChatMessage>();
+            if (msg.direction == MessageDirection::IN) {
+                SPDLOG_DEBUG("📥 [RECEIVED] I/O Worker: Enqueueing disk write for incoming message: '{}'", msg.content);
+            } else {
+                SPDLOG_DEBUG("📤 [SENT] I/O Worker: Enqueueing disk write for outgoing message: '{}'", msg.content);
+            }
+
+            m_ioWorker.enqueue([this, lobbyName, msg]() {
+                auto res = appendHistory(lobbyName, {msg});
+                if (!res)
+                    SPDLOG_ERROR("Failed to append history: {}", storeErrorToString(res.error()));
+            });
+        }
+        else if (it.key() == "message_sent_confirm" || it.key() == "message_resynced")
+        {
+            metadataChanged = true; // acked_seq_nums and resynced_seq_nums are in the main lobby file
+        }
+        else
+        {
+            metadataChanged = true;
+        }
+    }
+
     observer->onUpdate(jsonPatch);
-    saveLobbyData(observer->getLobbyData());
+
+    if (metadataChanged)
+    {
+        auto data = observer->getLobbyData();
+        m_ioWorker.enqueue([this, data]() {
+            auto res = saveLobbyData(data);
+            if (!res)
+                SPDLOG_ERROR("Failed to save lobby metadata: {}", storeErrorToString(res.error()));
+        });
+    }
 }
 
-std::expected<LobbyData, std::string> LobbyStore::loadLobbyDataFromFile(const std::filesystem::path &filePath)
+std::expected<LobbyData, StoreError> LobbyStore::loadLobbyDataFromFile(const std::filesystem::path &filePath)
 {
     if (!std::filesystem::exists(filePath))
     {
-        return std::unexpected("File does not exist");
+        return std::unexpected(StoreError::FileNotFound);
     }
 
     try
@@ -95,7 +210,7 @@ std::expected<LobbyData, std::string> LobbyStore::loadLobbyDataFromFile(const st
         std::ifstream inFile(filePath, std::ios::binary | std::ios::ate);
         if (!inFile)
         {
-            return std::unexpected("Failed to open file for reading: " + filePath.string());
+            return std::unexpected(StoreError::FileOpenFailed);
         }
         std::streamsize size = inFile.tellg();
         inFile.seekg(0, std::ios::beg);
@@ -103,26 +218,87 @@ std::expected<LobbyData, std::string> LobbyStore::loadLobbyDataFromFile(const st
         std::vector<unsigned char> ciphertextBlob(size);
         if (!inFile.read(reinterpret_cast<char *>(ciphertextBlob.data()), size))
         {
-            return std::unexpected("Failed to read data from file: " + filePath.string());
+            return std::unexpected(StoreError::ReadFailed);
         }
 
-        auto plaintextRes = CryptoUtils::decryptAES256GCM(ciphertextBlob, m_masterKey);
+        std::vector<unsigned char> currentKey;
+        {
+            std::lock_guard<std::mutex> lock(m_saveMutex);
+            currentKey = m_masterKey;
+        }
+
+        auto plaintextRes = CryptoUtils::decryptAES256GCM(ciphertextBlob, currentKey);
         if (!plaintextRes)
         {
-            return std::unexpected("Failed to decrypt data: " + plaintextRes.error());
+            return std::unexpected(StoreError::DecryptionFailed);
         }
         std::vector<unsigned char> plaintext = *plaintextRes;
 
         std::string jsonStr(plaintext.begin(), plaintext.end());
         nlohmann::json j = nlohmann::json::parse(jsonStr);
-        return j.get<LobbyData>();
+        LobbyData lobbyData = j.get<LobbyData>();
+
+        bool legacyMigrationNeeded = false;
+        if (j.contains("history") && !j["history"]["messages"].empty())
+        {
+            legacyMigrationNeeded = true;
+        }
+
+        std::string historyFilename = Util::toHex(Hasher::getInstance().getHashMsg256(lobbyData.lobby_name)) + ".history.enc";
+        std::filesystem::path historyFilePath = std::filesystem::path(m_storeDir) / "lobbies" / historyFilename;
+
+        if (legacyMigrationNeeded)
+        {
+            SPDLOG_INFO("Migrating legacy history for lobby: {}", lobbyData.lobby_name);
+            auto res = appendHistory(lobbyData.lobby_name, lobbyData.history.messages);
+            if (res)
+            {
+                // Re-save without history to complete migration
+                if (auto saveRes = saveLobbyData(lobbyData); !saveRes)
+                    SPDLOG_ERROR("Failed to save lobby data during migration: {}", storeErrorToString(saveRes.error()));
+            }
+        }
+        else if (std::filesystem::exists(historyFilePath))
+        {
+            std::ifstream histFile(historyFilePath, std::ios::binary);
+            if (histFile)
+            {
+                while (histFile.peek() != EOF)
+                {
+                    uint32_t msgSize = 0;
+                    if (!histFile.read(reinterpret_cast<char *>(&msgSize), sizeof(msgSize)))
+                        break;
+
+                    std::vector<unsigned char> msgCiphertext(msgSize);
+                    if (!histFile.read(reinterpret_cast<char *>(msgCiphertext.data()), msgSize))
+                        break;
+
+                    auto msgPlaintextRes = CryptoUtils::decryptAES256GCM(msgCiphertext, currentKey);
+                    if (msgPlaintextRes)
+                    {
+                        std::string msgJsonStr(msgPlaintextRes->begin(), msgPlaintextRes->end());
+                        try
+                        {
+                            nlohmann::json msgJson = nlohmann::json::parse(msgJsonStr);
+                            lobbyData.history.messages.push_back(msgJson.get<ChatMessage>());
+                        }
+                        catch (const std::exception &e)
+                        {
+                            SPDLOG_ERROR("Failed to parse history message: {}", e.what());
+                        }
+                    }
+                }
+            }
+        }
+
+        return lobbyData;
     }
     catch (const std::exception &e)
     {
         SPDLOG_ERROR("Error loading lobby data from {}: {} (Wrong Master Password "
                      "or corrupted data?)",
                      filePath.string(), e.what());
-        return std::unexpected(e.what());
+        return std::unexpected(StoreError::Unknown);
     }
 }
 
@@ -172,6 +348,7 @@ std::vector<std::shared_ptr<LobbyObserver>> LobbyStore::getLobbies()
 
 void LobbyStore::savePreferences(const nlohmann::json &prefs)
 {
+    std::lock_guard<std::mutex> lock(m_saveMutex);
     std::string filename = "preferences.enc";
     std::filesystem::path filePath = std::filesystem::path(m_storeDir) / "pref" / filename;
     std::filesystem::path tmpPath = filePath.string() + ".tmp";
@@ -182,7 +359,8 @@ void LobbyStore::savePreferences(const nlohmann::json &prefs)
     try
     {
         auto ciphertextRes = CryptoUtils::encryptAES256GCM(plaintext, m_masterKey);
-        if (!ciphertextRes) {
+        if (!ciphertextRes)
+        {
             SPDLOG_ERROR("Failed to encrypt preferences: {}", ciphertextRes.error());
             return;
         }
@@ -231,7 +409,13 @@ nlohmann::json LobbyStore::loadPreferences()
             return nlohmann::json::object();
         }
 
-        auto plaintextRes = CryptoUtils::decryptAES256GCM(ciphertextBlob, m_masterKey);
+        std::vector<unsigned char> currentKey;
+        {
+            std::lock_guard<std::mutex> lock(m_saveMutex);
+            currentKey = m_masterKey;
+        }
+
+        auto plaintextRes = CryptoUtils::decryptAES256GCM(ciphertextBlob, currentKey);
         if (!plaintextRes)
         {
             SPDLOG_ERROR("Failed to decrypt preferences: {}", plaintextRes.error());
@@ -249,19 +433,49 @@ nlohmann::json LobbyStore::loadPreferences()
 
 void LobbyStore::updateMasterPassword(const std::string &newPassword)
 {
-    // 1. Read all data with the old key
-    auto lobbies = getLobbies();
-    auto prefs = loadPreferences();
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
 
-    // 2. Update the master key in memory
-    m_masterKey = Hasher::getInstance().getHashMsg256(newPassword);
+    m_ioWorker.enqueue([this, newPassword, &promise]() {
+        try {
+            // 1. Read all data with the old key
+            auto lobbies = getLobbies();
+            auto prefs = loadPreferences();
 
-    // 3. Rewrite all data with the new key
-    for (const auto &lobby : lobbies)
-    {
-        saveLobbyData(lobby->getLobbyData()); // Uses atomic rename, it is clean
+            // 2. Update the master key in memory
+            std::vector<unsigned char> newKey = Hasher::getInstance().getHashMsg256(newPassword);
+            {
+                std::lock_guard<std::mutex> lock(m_saveMutex);
+                m_masterKey = newKey;
+            }
+
+            // 3. Rewrite all data with the new key
+            for (const auto &lobby : lobbies)
+            {
+                auto lobbyData = lobby->getLobbyData();
+                if (auto saveRes = saveLobbyData(lobbyData); !saveRes)
+                    SPDLOG_ERROR("Failed to save lobby data during master password update: {}", storeErrorToString(saveRes.error()));
+                
+                if (!lobbyData.history.messages.empty())
+                {
+                    std::string historyFilename = Util::toHex(Hasher::getInstance().getHashMsg256(lobbyData.lobby_name)) + ".history.enc";
+                    std::filesystem::path historyFilePath = std::filesystem::path(m_storeDir) / "lobbies" / historyFilename;
+                    std::filesystem::remove(historyFilePath);
+                    appendHistory(lobbyData.lobby_name, lobbyData.history.messages);
+                }
+            }
+            savePreferences(prefs);
+
+            SPDLOG_INFO("Master password updated and all files re-encrypted.");
+            promise.set_value();
+        } catch (...) {
+            promise.set_exception(std::current_exception());
+        }
+    });
+
+    try {
+        future.get();
+    } catch (const std::exception& e) {
+        SPDLOG_ERROR("Failed to update master password: {}", e.what());
     }
-    savePreferences(prefs);
-
-    SPDLOG_INFO("Master password updated and all files re-encrypted.");
 }

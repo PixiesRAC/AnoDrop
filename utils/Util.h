@@ -17,7 +17,7 @@ namespace Util
 template <typename T>
 concept ByteRange = std::ranges::input_range<T> && sizeof(std::ranges::range_value_t<T>) == 1;
 
-template <ByteRange T> static std::string toHex(const T &bytes)
+template <ByteRange T> inline std::string toHex(const T &bytes)
 {
     std::string hex;
     const char hexChars[] = "0123456789abcdef";
@@ -30,7 +30,7 @@ template <ByteRange T> static std::string toHex(const T &bytes)
     return hex;
 }
 
-static std::vector<unsigned char> fromHex(const std::string &hex)
+inline std::vector<unsigned char> fromHex(const std::string &hex)
 {
     std::vector<unsigned char> bytes;
     if (hex.length() % 2 != 0)

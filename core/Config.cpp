@@ -2,7 +2,6 @@
 
 #include <fstream>
 #include <nlohmann/json.hpp>
-#define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_TRACE
 #include <spdlog/spdlog.h>
 
 Config::Config(int argc, char *argv[]) : m_storePath("store"), m_logPath("anodrop.log")
@@ -38,6 +37,10 @@ Config::Config(int argc, char *argv[]) : m_storePath("store"), m_logPath("anodro
                         SPDLOG_WARN("Config file does not contain a valid 'log_path' "
                                     "string. Using default.");
                     }
+                    if (configJson.contains("log_level") && configJson["log_level"].is_string())
+                    {
+                        m_logLevel = configJson["log_level"].get<std::string>();
+                    }
                     if (configJson.contains("fetch_interval_ms") && configJson["fetch_interval_ms"].is_number_integer())
                     {
                         m_fetchInterval = configJson["fetch_interval_ms"].get<int>();
@@ -45,6 +48,14 @@ Config::Config(int argc, char *argv[]) : m_storePath("store"), m_logPath("anodro
                     if (configJson.contains("argon2_iterations") && configJson["argon2_iterations"].is_number_integer())
                     {
                         m_argon2Iterations = configJson["argon2_iterations"].get<int>();
+                    }
+                    if (configJson.contains("max_concurrent_fetches") && configJson["max_concurrent_fetches"].is_number_integer())
+                    {
+                        m_maxConcurrentFetches = configJson["max_concurrent_fetches"].get<int>();
+                    }
+                    if (configJson.contains("extra_salt_data_for_lobby_handshake") && configJson["extra_salt_data_for_lobby_handshake"].is_string())
+                    {
+                        m_extraSaltDataForLobbyHandshake = configJson["extra_salt_data_for_lobby_handshake"].get<std::string>();
                     }
                 }
                 else
@@ -70,6 +81,11 @@ std::string Config::getLogPath() const
     return m_logPath;
 }
 
+std::string Config::getLogLevel() const
+{
+    return m_logLevel;
+}
+
 int Config::getFetchInterval() const
 {
     return m_fetchInterval;
@@ -78,4 +94,14 @@ int Config::getFetchInterval() const
 int Config::getArgon2Iterations() const
 {
     return m_argon2Iterations;
+}
+
+int Config::getMaxConcurrentFetches() const
+{
+    return m_maxConcurrentFetches;
+}
+
+std::string Config::getExtraSaltDataForLobbyHandshake() const
+{
+    return m_extraSaltDataForLobbyHandshake;
 }

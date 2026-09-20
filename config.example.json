@@ -1,0 +1,16 @@
+{
+  // Path to the folder where data will be stored (relative or absolute path)
+  "store_path": "./store",
+  // Path to the log file
+  "log_path": "./anodrop.log",
+  // DHT network refresh interval in milliseconds
+  "fetch_interval_ms": 5000,
+  // Number of iterations for Argon2 password hashing (higher is more secure but slower)
+  "argon2_iterations": 5,
+  // Maximum number of concurrent asynchronous DHT fetch requests
+  "max_concurrent_fetches": 5000,
+  // Global cryptographic salt for Lobby hashing (all clients must use the same to find each other)
+  "extra_salt_data_for_lobby_handshake": "AnoDrop",
+  // Log verbosity level (Possible values: "trace", "debug", "info", "warn", "err", "critical", "off")
+  "log_level": "info"
+}

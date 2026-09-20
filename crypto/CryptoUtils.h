@@ -5,6 +5,8 @@
 #include <vector>
 #include <expected>
 
+#include <openssl/crypto.h>
+
 namespace CryptoUtils
 {
     std::expected<std::vector<unsigned char>, std::string> encryptAES256GCM(const std::vector<unsigned char> &plaintext, const std::vector<unsigned char> &key);

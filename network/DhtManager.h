@@ -4,6 +4,7 @@
 #include "network/AlertObserver.h"
 #include "utils/Util.h"
 
+#include "lobby/LobbyObserver.h"
 #include "lobby/LobbyStore.h"
 #include <atomic>
 #include <libtorrent/session.hpp>
@@ -12,14 +13,18 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
-#include <thread>
 #include <semaphore>
+#include <thread>
+#include <unordered_map>
+#include <functional>
 
 class DhtManager : public AlertObserver
 {
   public:
     DhtManager();
     ~DhtManager();
+    void setLobbyStore(std::shared_ptr<LobbyStore> lobbyStore);
+    std::shared_ptr<LobbyStore> getLobbyStore() const;
 
     lt::session *getSession() const;
     std::shared_ptr<lt::session> getSharedSession() const;
@@ -36,23 +41,39 @@ class DhtManager : public AlertObserver
 
     void resetPutConfirmed();
     void waitForPutConfirmed(const std::string &context = "");
+    void registerPendingPut(const std::string& targetHex, const std::string& lobbyName, std::int64_t seqNum);
 
-    /* HANDHSAKE */
 
-    static std::optional<nlohmann::json> decryptDhtHandShakePayload(const std::string &ciphertextStr, const std::string &lobbyName);
-    static std::string encryptDhtHandshakePayload(const nlohmann::json &payload, const std::string &lobbyName);
-    static std::optional<std::vector<unsigned char>> prepareLobbyPayload(std::shared_ptr<LobbyStore> lobbyStore, const std::string &lobbyName, const std::string &pseudo);
+    /* HANDSHAKE */
+
+    using DhtItemCallback = std::function<void(const lt::dht_mutable_item_alert*)>;
+    void fetchDhtItem(const std::string &rawKeyString, const std::string &lobbyName, DhtItemCallback callback, bool isSeqNum = false, std::int64_t seqNumTarget = -1);
 
     /* END HANDSHAKE*/
 
   private:
+    void handleDhtStatsAlert(const lt::dht_stats_alert *stats);
+    void handleMutableItemAlert(const lt::dht_mutable_item_alert *get_mut);
+
     std::shared_ptr<lt::session> m_session;
+    std::shared_ptr<LobbyStore> m_lobbyStore;
     std::optional<lt::sha1_hash> m_nodeIdIpv4;
     std::optional<lt::sha1_hash> m_nodeIdIpv6;
+
+    std::mutex m_pendingPutsMutex;
+    std::unordered_map<std::string, std::pair<std::string, std::int64_t>> m_pendingPuts;
     std::atomic_bool m_isDhtReady{false};
     std::binary_semaphore m_putConfirmedSem{0};
     mutable std::mutex m_nodeIdMutex;
 
     std::unique_ptr<AlertListener> m_alertListener;
     std::jthread m_alertThread;
+
+    struct FetchContext
+    {
+        DhtItemCallback callback;
+        bool isSeqNum;
+    };
+    std::unordered_map<std::string, FetchContext> m_fetchCallbacks;
+    std::mutex m_registryMutex;
 };
