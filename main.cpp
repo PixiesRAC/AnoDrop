@@ -1,20 +1,18 @@
-#include "core/DhtPublisher.h"
-#include "crypto/Hasher.h"
-#include "lobby/LobbyFetcher.h"
-#include "lobby/LobbyStore.h"
-#include "network/DhtManager.h"
-#include "ui/GuiBuilder.h"
-#include "ui/Unlock.h"
-#include "utils/Logger.h"
-
+#include "LobbyDataSerializer.h"
+#include <iostream>
 #include <memory>
 #include <spdlog/spdlog.h>
 
-#include "core/Config.h"
+#include "Config.h"
+#include "DhtManager.h"
+#include "DhtPublisher.h"
+#include "GuiBuilder.h"
+#include "Hasher.h"
+#include "LobbyFetcher.h"
+#include "LobbyStore.h"
+#include "Logger.h"
+#include "Unlock.h"
 
-#include <iostream>
-
-// TODO MAYBE : RESYNCHRO EMPTY BASE
 int main(int argc, char *argv[])
 {
     for (int i = 1; i < argc; ++i)
@@ -35,14 +33,38 @@ int main(int argc, char *argv[])
 
     Config config(argc, argv);
     Logger::init(config.getLogPath(), config.getLogLevel());
+    
+    // Log all startup parameters
+    SPDLOG_INFO("Config: LogPath={}, LogLevel={}, StorePath={}, MaxConcurrentFetches={}, FetchInterval={}ms, PullMessagesOnStartup={}", 
+                config.getLogPath(), config.getLogLevel(), config.getStorePath(), 
+                config.getMaxConcurrentFetches(), config.getFetchInterval(), config.getPullMessagesOnStartup());
+
     Hasher::getInstance().setConfig(config);
     const std::string storePath = config.getStorePath();
-
     ui::GuiBuilder gui;
-    const std::string masterPwd = ui::Unlock::askMasterPassword();
-    gui.showLoadingScreen();
 
-    std::shared_ptr<LobbyStore> lobbyStore = std::make_shared<LobbyStore>(masterPwd, storePath);
+    std::shared_ptr<LobbyStore> lobbyStore;
+    std::string errorMessage = "";
+
+    while (true)
+    {
+        const std::string masterPwd = ui::Unlock::askMasterPassword(errorMessage);
+        if (masterPwd.empty())
+        {
+            return 0;
+        }
+        gui.showLoadingScreen();
+        try
+        {
+            lobbyStore = std::make_shared<LobbyStore>(masterPwd, storePath);
+            break;
+        }
+        catch (const std::exception &e)
+        {
+            errorMessage = e.what();
+        }
+    }
+
     std::unique_ptr<DhtManager> dhtManager = std::make_unique<DhtManager>();
     dhtManager->setLobbyStore(lobbyStore);
     std::shared_ptr<DhtPublisher> dhtPublisher = std::make_shared<DhtPublisher>();
@@ -53,9 +75,15 @@ int main(int argc, char *argv[])
         dhtManager->startAlertThread();
         dhtManager->waitUntilDhtIsReady();
         dhtPublisher->setDhtManager(std::move(dhtManager));
-        gui.setDhtPublisher(dhtPublisher);
-        gui.setLobbyStore(lobbyStore);
-        gui.setAppFacade(std::make_unique<AppFacade>(dhtPublisher, lobbyStore));
+        
+        auto appFacade = std::make_unique<AppFacade>(dhtPublisher, lobbyStore);
+        if (config.getPullMessagesOnStartup())
+        {
+            // Pull messages on startup ensures that any missed messages while offline are retrieved
+            SPDLOG_INFO("PullMessagesOnStartup is enabled: Synchronizing all active lobbies.");
+            appFacade->synchronizeAllActiveLobbies();
+        }
+        gui.setAppFacade(std::move(appFacade));
     }
     else
     {
@@ -63,13 +91,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::unique_ptr<LobbyFetcher> lobbyFetcher = std::make_unique<LobbyFetcher>(dhtPublisher, lobbyStore, config.getFetchInterval());
+    std::unique_ptr<LobbyFetcher> lobbyStateFetcher = std::make_unique<LobbyFetcher>(dhtPublisher, lobbyStore, config.getFetchInterval());
 
-    lobbyFetcher->ProcessLobbies();
+    lobbyStateFetcher->ProcessLobbies();
     gui.buildAndRun(); // loop
 
     SPDLOG_INFO("Shutting down AnoDrop...");
-    lobbyFetcher->stop();
+    lobbyStateFetcher->stop();
+    dhtPublisher->shutdown(); // Stops DHT and all workers securely
     SPDLOG_INFO("LobbyFetcher stopped. Cleaning up...");
     return 0;
 }

@@ -14,7 +14,7 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
+add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE FMT_CONSTEVAL=constexpr)
 
 add_compile_options(
     -Wall
@@ -34,33 +34,39 @@ find_package(nlohmann_json REQUIRED)
 
 add_executable(AnoDrop
     main.cpp
-    core/DhtPublisher.cpp
-    core/Config.cpp
-    lobby/LobbyStore.cpp
-    lobby/LobbyListener.cpp
-    lobby/Lobby.cpp
-    lobby/LobbyFetcher.cpp
-    crypto/CryptoUtils.cpp
-    network/Dropper.cpp
-    ui/GuiBuilder.cpp
-    network/DhtManager.cpp
-    utils/Logger.cpp
-    utils/WorkerThread.cpp
-    network/AlertListener.cpp
-    ui/Unlock.cpp
-    crypto/HandshakeKeyService.cpp
-    crypto/HandshakePayloadCodec.cpp
-    lobby/HandshakeStateEngine.cpp
-    ui/HandshakeView.cpp
-    ui/ChangePasswordView.cpp
-    ui/LobbiesView.cpp
-    ui/ChatView.cpp
-    ui/GuiPreferences.cpp
-    ui/AnomalyFlagView.cpp
-    core/AppFacade.cpp
-    chat/DhtChat.cpp
-    chat/DhtChatHandler.cpp
-    chat/ChatResyncer.cpp
+    network/src/DhtPublisher.cpp
+    anomaly/src/AnomalyHandler.cpp
+    heartbeat/src/HeartBeatHandler.cpp
+    ack/src/AckHandler.cpp
+    core/src/Config.cpp
+    storage/src/LobbyStore.cpp
+    lobby/src/LobbyListener.cpp
+    lobby/src/LobbyDataSerializer.cpp
+    lobby/src/Lobby.cpp
+    lobby/src/LobbyFetcher.cpp
+    crypto/src/CryptoUtils.cpp
+    network/src/Dropper.cpp
+    ui/src/GuiBuilder.cpp
+    network/src/DhtManager.cpp
+    utils/src/Logger.cpp
+    utils/src/IoWorker.cpp
+    utils/src/PartitionedThreadPool.cpp
+    utils/src/TimeUtils.cpp
+    network/src/AlertListener.cpp
+    ui/src/Unlock.cpp
+    crypto/src/HandshakeKeyService.cpp
+    crypto/src/HandshakePayloadCodec.cpp
+    lobby/src/HandshakeStateEngine.cpp
+    ui/src/HandshakeView.cpp
+    ui/src/ChangePasswordView.cpp
+    ui/src/LobbiesView.cpp
+    ui/src/ChatView.cpp
+    ui/src/MessageStatusResolver.cpp
+    ui/src/AnomalyFlagView.cpp
+    core/src/AppFacade.cpp
+    chat/src/DhtChat.cpp
+    chat/src/DhtChatHandler.cpp
+    chat/src/ChatResyncer.cpp
 )
 
 target_link_libraries(AnoDrop
@@ -74,18 +80,4 @@ target_link_libraries(AnoDrop
     argon2
 )
 
-target_include_directories(AnoDrop PRIVATE ${CURSES_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-
-include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG        v1.14.0
-)
-# For Windows: Prevent overriding the parent project's compiler/linker settings
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
-
-enable_testing()
-
-include(GoogleTest)
+target_include_directories(AnoDrop PRIVATE ${CURSES_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/anomaly/include ${CMAKE_CURRENT_SOURCE_DIR}/ack/include ${CMAKE_CURRENT_SOURCE_DIR}/chat/include ${CMAKE_CURRENT_SOURCE_DIR}/core/include ${CMAKE_CURRENT_SOURCE_DIR}/crypto/include ${CMAKE_CURRENT_SOURCE_DIR}/heartbeat/include ${CMAKE_CURRENT_SOURCE_DIR}/lobby/include ${CMAKE_CURRENT_SOURCE_DIR}/network/include ${CMAKE_CURRENT_SOURCE_DIR}/storage/include ${CMAKE_CURRENT_SOURCE_DIR}/ui/include ${CMAKE_CURRENT_SOURCE_DIR}/utils/include)
