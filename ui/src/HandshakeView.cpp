@@ -1,6 +1,7 @@
 #include "HandshakeView.h"
 
 #include <ncurses.h>
+#include <openssl/crypto.h>
 
 namespace ui
 {
@@ -19,6 +20,7 @@ void HandshakeView::show()
     char channelName[256];
     getnstr(channelName, 255);
     std::string passphrase(channelName);
+    OPENSSL_cleanse(channelName, sizeof(channelName));
 
     if (m_appFacade && m_appFacade->unhideLobbyIfExists(passphrase))
     {
@@ -39,6 +41,7 @@ void HandshakeView::show()
     curs_set(0);
 
     std::string pseudo(pseudoBuf);
+    OPENSSL_cleanse(pseudoBuf, sizeof(pseudoBuf));
 
     try
     {

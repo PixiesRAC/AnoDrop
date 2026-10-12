@@ -4,6 +4,8 @@
 
 #include "AlertObserver.h"
 
+#include <shared_mutex>
+
 class AlertListener
 {
   public:
@@ -15,6 +17,7 @@ class AlertListener
     void removeObserver(AlertObserver *observer);
 
   private:
+    mutable std::shared_mutex m_observersMutex;
     std::vector<AlertObserver *> m_observers;
     std::shared_ptr<lt::session> m_session;
 };

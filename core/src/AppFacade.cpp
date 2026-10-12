@@ -5,22 +5,44 @@
 #include <spdlog/spdlog.h>
 
 #include "AnomalyHandler.h"
+#include "NetworkResyncHandler.h"
+#include "DhtChatHandler.h"
 
 constexpr auto POLLING_TIMEOUT = std::chrono::milliseconds(5000);
-constexpr auto MAX_TIMEOUT_COUNT = 50;
+constexpr auto MAX_TIMEOUT_COUNT = 3;
 
-AppFacade::AppFacade(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore) : m_dhtPublisher(std::move(dhtPublisher)), m_lobbyStore(std::move(lobbyStore))
+AppFacade::AppFacade(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore, bool autoPullMessages) : m_dhtPublisher(std::move(dhtPublisher)), m_lobbyStore(std::move(lobbyStore)), m_autoPullMessages(autoPullMessages)
 {
+    m_chatHandler = std::make_unique<DhtChatHandler>();
+    if (m_dhtPublisher)
+    {
+        m_chatHandler->setDhtPublisher(m_dhtPublisher);
+    }
+    m_networkResyncer = std::make_unique<NetworkResyncHandler>(m_dhtPublisher, m_lobbyStore);
+    if (m_dhtPublisher && m_dhtPublisher->getDhtManager())
+    {
+        m_networkResyncer->attach(m_dhtPublisher->getDhtManager());
+    }
     m_syncThread = std::jthread(&AppFacade::syncThreadLoop, this);
 }
 
-AppFacade::~AppFacade()
+void AppFacade::shutdown()
 {
     m_syncThread.request_stop();
+    m_syncCv.notify_all();
     if (m_syncThread.joinable())
     {
         m_syncThread.join();
     }
+    if (m_networkResyncer)
+    {
+        m_networkResyncer->detach();
+    }
+}
+
+AppFacade::~AppFacade()
+{
+    shutdown();
 }
 
 std::vector<std::shared_ptr<LobbyObserver>> AppFacade::getLobbies() const
@@ -86,8 +108,8 @@ void AppFacade::synchronizeAndProcessNewIncomingMessage(std::shared_ptr<LobbyObs
         throw std::runtime_error("Dependencies missing in AppFacade");
     }
 
-    auto status = lobbyObs->getLobbyData().status;
-    if (status != LobbyStatus::HANDSHAKE_DONE && status != LobbyStatus::ANOMALY)
+    auto meta = lobbyObs->getMetadata();
+    if (meta.is_hidden || (meta.status != LobbyStatus::HANDSHAKE_DONE && meta.status != LobbyStatus::ANOMALY))
     {
         return;
     }
@@ -97,17 +119,21 @@ void AppFacade::synchronizeAndProcessNewIncomingMessage(std::shared_ptr<LobbyObs
     if (it == m_activeSyncLobbies.end())
     {
         m_activeSyncLobbies.push_back(lobbyObs);
+        m_syncCv.notify_one();
     }
 }
 
 void AppFacade::syncThreadLoop(std::stop_token stoken)
 {
     std::unordered_map<std::string, int> timeoutCounters;
-    std::mutex cv_m;
-    std::condition_variable_any cv;
 
     while (!stoken.stop_requested())
     {
+        if (m_autoPullMessages)
+        {
+            synchronizeAllActiveLobbies();
+        }
+
         std::vector<std::shared_ptr<LobbyObserver>> lobbiesToSync;
         {
             std::lock_guard<std::mutex> lock(m_syncMutex);
@@ -119,13 +145,18 @@ void AppFacade::syncThreadLoop(std::stop_token stoken)
             if (!obs->isFetchingSeq())
             {
                 timeoutCounters[obs->getLobbyName()] = 0;
-                LobbyData data = obs->getLobbyData();
-                std::string targetKey = data.private_node_discussion + data.announced_x25519_pub;
+                std::string targetKey;
+                obs->withDataView([&targetKey](const LobbyMetadata &, const LobbySyncState &, const LobbyCryptoVault &crypto) {
+                    targetKey = crypto.private_node_discussion + crypto.announced_x25519_pub;
+                });
                 if (m_dhtPublisher)
                 {
                     obs->setFetchingSeq();
-                    m_dhtPublisher->enqueueNetworkTask(obs->getLobbyName(), [this, targetKey, obs]()
-                                                       { m_dhtPublisher->fetchDhtItem(targetKey, obs, true); });
+                    m_dhtPublisher->enqueueNetworkTask(obs->getLobbyName(), [pub = m_dhtPublisher, targetKey, obs]()
+                                                       {
+                                                           if (pub)
+                                                               pub->fetchDhtItem(targetKey, obs, true);
+                                                       });
                 }
             }
             else
@@ -138,9 +169,14 @@ void AppFacade::syncThreadLoop(std::stop_token stoken)
                     timeoutCounters[obs->getLobbyName()] = 0;
                 }
             }
+
+            if (m_networkResyncer)
+            {
+                m_networkResyncer->retryUnconfirmedMessages(obs);
+            }
         }
-        std::unique_lock<std::mutex> cv_lock(cv_m);
-        cv.wait_for(cv_lock, stoken, POLLING_TIMEOUT, []{ return false; });
+        std::unique_lock<std::mutex> cv_lock(m_syncMutex);
+        m_syncCv.wait_for(cv_lock, stoken, POLLING_TIMEOUT, []{ return false; });
     }
 }
 
@@ -167,7 +203,7 @@ bool AppFacade::unhideLobbyIfExists(const std::string &lobbyName)
     if (m_lobbyStore)
     {
         auto lobby = m_lobbyStore->getLobby(lobbyName);
-        if (lobby != nullptr && lobby->getLobbyData().is_hidden)
+        if (lobby != nullptr && lobby->getMetadata().is_hidden)
         {
             nlohmann::json patch = {{"is_hidden", false}};
             m_lobbyStore->asyncUpdateLobbyData(lobbyName, patch);

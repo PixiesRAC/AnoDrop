@@ -1,5 +1,7 @@
-#include <nlohmann/json.hpp>
 #pragma once
+
+#include <mutex>
+#include <shared_mutex>
 
 #include "LobbyObserver.h"
 
@@ -12,14 +14,15 @@ class LobbyListener
     void addObserver(std::shared_ptr<LobbyObserver> observer);
     void removeObserver(std::shared_ptr<LobbyObserver> observer);
 
-    bool hasAlreadyObserver(const std::string &lobbyName);
-    std::shared_ptr<LobbyObserver> getObserver(const std::string &lobbyName);
-    const std::vector<std::shared_ptr<LobbyObserver>> &getObservers() const
+    [[nodiscard]] std::shared_ptr<LobbyObserver> getObserver(const std::string &lobbyName);
+    [[nodiscard]] std::shared_ptr<LobbyObserver> getOrCreateObserver(const std::string &lobbyName, std::function<std::shared_ptr<LobbyObserver>()> factory);
+    [[nodiscard]] std::vector<std::shared_ptr<LobbyObserver>> getObservers() const
     {
+        std::shared_lock<std::shared_mutex> lock(m_listenerMutex);
         return m_observers;
     }
-    void notifyObservers(const std::string &lobbyName, const nlohmann::json &jsonPatch);
 
   private:
     std::vector<std::shared_ptr<LobbyObserver>> m_observers;
+    mutable std::shared_mutex m_listenerMutex;
 };

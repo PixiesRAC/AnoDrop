@@ -7,7 +7,7 @@
 
 namespace ui
 {
-LobbiesView::LobbiesView(std::shared_ptr<AppFacade> appFacade, DhtChatHandler *chatHandler) : m_appFacade(appFacade), m_chatHandler(chatHandler)
+LobbiesView::LobbiesView(std::shared_ptr<AppFacade> appFacade) : m_appFacade(std::move(appFacade))
 {
 }
 
@@ -24,29 +24,30 @@ void LobbiesView::show()
         std::vector<std::shared_ptr<LobbyObserver>> lobbiesObservers;
         for (const auto &obs : allObservers)
         {
-            if (!obs->getLobbyData().is_hidden)
+            if (!obs->getMetadata().is_hidden)
             {
                 lobbiesObservers.push_back(obs);
             }
         }
 
-        if (m_chatHandler->getChatCount() != lobbiesObservers.size())
+        auto chatHandler = m_appFacade ? m_appFacade->getChatHandler() : nullptr;
+        if (chatHandler && chatHandler->getChatCount() != lobbiesObservers.size())
         {
-            m_chatHandler->clearChats();
+            chatHandler->clearChats();
             for (const auto &obs : lobbiesObservers)
             {
                 auto lobbyPtr = std::dynamic_pointer_cast<Lobby>(obs);
                 if (lobbyPtr)
                 {
-                    m_chatHandler->addChat(*lobbyPtr);
+                    chatHandler->addChat(*lobbyPtr);
                 }
             }
         }
 
-        std::vector<LobbyData> lobbies;
+        std::vector<LobbyMetadata> lobbies;
         for (const auto &obs : lobbiesObservers)
         {
-            lobbies.push_back(obs->getLobbyData());
+            lobbies.push_back(obs->getMetadata());
         }
 
         if (lobbies.empty())
@@ -75,7 +76,7 @@ void LobbiesView::show()
 
             std::string dispName = "[" + pseudo1 + " - " + pseudo2 + "] " + lobbyName;
 
-            bool hasUnread = lobbies[i].history.messages.size() > lobbies[i].read_messages_count;
+            bool hasUnread = lobbiesObservers[i]->hasUnreadMessages();
 
             int maxDispLen = COLS > 80 ? COLS - 45 : 35; // Responsive to terminal size
             if (dispName.length() > (size_t)maxDispLen)
@@ -156,7 +157,7 @@ void LobbiesView::show()
             if (!lobbiesObservers.empty())
             {
                 auto &lobbyObs = lobbiesObservers[static_cast<size_t>(selectedLobby)];
-                m_appFacade->hideLobby(lobbyObs->getLobbyData().lobby_name);
+                m_appFacade->hideLobby(lobbyObs->getLobbyName());
 
                 if (selectedLobby > 0 && selectedLobby == (int)lobbiesObservers.size() - 1)
                 {
@@ -172,7 +173,7 @@ void LobbiesView::show()
         {
             selectedLobby++;
         }
-        else if (ch == 10)
+        else if (ch == 10 || ch == 13 || ch == KEY_ENTER)
         { // ENTER
             if (lobbies[static_cast<size_t>(selectedLobby)].status == LobbyStatus::HANDSHAKE_DONE || lobbies[static_cast<size_t>(selectedLobby)].status == LobbyStatus::ANOMALY)
             {
@@ -180,9 +181,18 @@ void LobbiesView::show()
                 wtimeout(stdscr, -1); // Disable timeout to wait for user input infinitely in chat
                 auto &lobbyObs = lobbiesObservers[static_cast<size_t>(selectedLobby)];
                 m_appFacade->synchronizeAndProcessNewIncomingMessage(lobbyObs);
-                ChatView chatView(lobbyObs, m_chatHandler->getChat(static_cast<size_t>(selectedLobby)));
+                auto lobbyPtr = std::dynamic_pointer_cast<Lobby>(lobbyObs);
+                DhtChat *dhtChat = (chatHandler && lobbyPtr) ? chatHandler->getChatForLobby(*lobbyPtr) : nullptr;
+                ChatView chatView(lobbyObs, dhtChat);
                 chatView.show();
                 wtimeout(stdscr, 200); // Restore timeout
+            }
+            else
+            {
+                attron(COLOR_PAIR(2) | A_BOLD);
+                mvprintw(LINES - 1, 2, "Cannot open: Lobby handshake is still pending with peer.");
+                attroff(COLOR_PAIR(2) | A_BOLD);
+                refresh();
             }
         }
     }

@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <unordered_map>
+#include <shared_mutex>
 
 #include "Config.h"
 #include "SaltParams.h"
@@ -21,9 +23,11 @@ class Hasher
     ~Hasher() = default;
 
     std::unique_ptr<Config> m_config;
+    mutable std::shared_mutex m_cacheMutex;
+    std::unordered_map<std::string, std::vector<unsigned char>> m_saltCache;
 
   public:
-    static Hasher &getInstance()
+    [[nodiscard]] static Hasher &getInstance()
     {
         static Hasher instance;
         return instance;
@@ -34,44 +38,55 @@ class Hasher
 
     void setConfig(const Config &config)
     {
-        // On stocke une copie sur le tas pour éviter le dangling pointer dans les tests
+        std::unique_lock<std::shared_mutex> lock(m_cacheMutex);
         m_config = std::make_unique<Config>(config);
+        m_saltCache.clear();
     }
 
-    inline std::vector<unsigned char> getHashMsg256(const std::string &rawMsg)
+    [[nodiscard]] inline std::vector<unsigned char> getHashMsg256(const std::string &rawMsg)
     {
-        EVP_MD_CTX *context = EVP_MD_CTX_new();
-        if (context == nullptr)
+        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
+        if (!context)
         {
             throw std::runtime_error("Failed to create EVP_MD_CTX");
         }
 
-        std::vector<unsigned char> hash(EVP_MD_size(EVP_sha256()));
+        std::vector<unsigned char> hash(static_cast<size_t>(EVP_MD_size(EVP_sha256())));
         unsigned int lengthOfHash = 0;
 
-        if (EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1 ||
-            EVP_DigestUpdate(context, rawMsg.c_str(), rawMsg.length()) != 1 ||
-            EVP_DigestFinal_ex(context, hash.data(), &lengthOfHash) != 1)
+        if (EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1 ||
+            EVP_DigestUpdate(context.get(), rawMsg.data(), rawMsg.size()) != 1 ||
+            EVP_DigestFinal_ex(context.get(), hash.data(), &lengthOfHash) != 1)
         {
-            EVP_MD_CTX_free(context);
             throw std::runtime_error("SHA-256 digest failed");
         }
 
-        EVP_MD_CTX_free(context);
         hash.resize(lengthOfHash);
         return hash;
     }
 
-    inline std::vector<unsigned char> generateArgon2Salt(const std::string &lobbyName)
+    [[nodiscard]] inline std::vector<unsigned char> generateArgon2Salt(const std::string &lobbyName)
     {
+        {
+            std::shared_lock<std::shared_mutex> rLock(m_cacheMutex);
+            auto it = m_saltCache.find(lobbyName);
+            if (it != m_saltCache.end())
+            {
+                return it->second;
+            }
+        }
+
         uint32_t iterations = 5;
         SaltParams params{};
 
-        const Config *cfg = m_config.get();
-        if (cfg)
         {
-            iterations = static_cast<uint32_t>(cfg->getArgon2Iterations());
-            params.extraValue = cfg->getExtraSaltDataForLobbyHandshake();
+            std::shared_lock<std::shared_mutex> rLock(m_cacheMutex);
+            const Config *cfg = m_config.get();
+            if (cfg)
+            {
+                iterations = static_cast<uint32_t>(cfg->getArgon2Iterations());
+                params.extraValue = cfg->getExtraSaltDataForLobbyHandshake();
+            }
         }
 
         std::vector<uint8_t> argon2Salt = params.serialize();
@@ -87,6 +102,11 @@ class Hasher
         if (result != ARGON2_OK)
         {
             throw std::runtime_error(std::string("Argon2id failed: ") + argon2_error_message(result));
+        }
+
+        {
+            std::unique_lock<std::shared_mutex> wLock(m_cacheMutex);
+            m_saltCache[lobbyName] = output;
         }
 
         return output;

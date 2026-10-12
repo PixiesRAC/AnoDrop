@@ -5,8 +5,8 @@
 namespace ui
 {
 
-AnomalyFlagView::AnomalyFlagView(std::shared_ptr<AppFacade> appFacade, std::shared_ptr<LobbyStore> lobbyStore)
-    : m_appFacade(appFacade), m_lobbyStore(lobbyStore)
+AnomalyFlagView::AnomalyFlagView(std::shared_ptr<AppFacade> appFacade)
+    : m_appFacade(std::move(appFacade))
 {
 }
 
@@ -24,15 +24,14 @@ void AnomalyFlagView::show()
         std::vector<std::string> options;
         options.push_back("[Manual Entry]");
 
-        if (m_lobbyStore)
+        if (m_appFacade)
         {
-            auto lobbies = m_lobbyStore->getLobbies();
+            auto lobbies = m_appFacade->getLobbies();
             for (const auto &obs : lobbies)
             {
-                auto l = obs->getLobbyData();
-                if (!l.is_hidden)
+                if (!obs->getMetadata().is_hidden)
                 {
-                    options.push_back(l.lobby_name);
+                    options.push_back(obs->getLobbyName());
                 }
             }
         }
@@ -62,7 +61,7 @@ void AnomalyFlagView::show()
         {
             selected++;
         }
-        else if (ch == 10)
+        else if (ch == 10 || ch == 13 || ch == KEY_ENTER)
         { // ENTER
             std::string targetLobby;
             if (selected == 0)

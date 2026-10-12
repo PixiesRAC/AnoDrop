@@ -15,8 +15,11 @@
 
 LobbyStore::LobbyStore(const std::string &masterPassword, const std::string &storeDir) : m_storeDir(storeDir)
 {
-    std::filesystem::create_directories(m_storeDir);
-    std::filesystem::create_directories(std::filesystem::path(m_storeDir) / "lobbies");
+    std::error_code ec;
+    std::filesystem::create_directories(m_storeDir, ec);
+    std::filesystem::permissions(m_storeDir, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec);
+    std::filesystem::create_directories(std::filesystem::path(m_storeDir) / "lobbies", ec);
+    std::filesystem::permissions(std::filesystem::path(m_storeDir) / "lobbies", std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec);
 
     std::filesystem::path vaultPath = std::filesystem::path(m_storeDir) / "vault.enc";
 
@@ -76,6 +79,8 @@ LobbyStore::LobbyStore(const std::string &masterPassword, const std::string &sto
         {
             throw std::runtime_error("Failed to write vault.enc");
         }
+        outFile.close();
+        std::filesystem::permissions(vaultPath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, ec);
     }
 
     m_lobbyListener = std::make_unique<LobbyListener>();
@@ -127,6 +132,9 @@ std::expected<void, StoreError> LobbyStore::saveLobbyData(const LobbyData &data)
         }
         outFile.close(); // Important to close before renaming
 
+        std::error_code permEc;
+        std::filesystem::permissions(tmpPath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, permEc);
+
         // Atomic rename by the OS
         std::filesystem::rename(tmpPath, filePath);
 
@@ -142,12 +150,6 @@ std::expected<void, StoreError> LobbyStore::saveLobbyData(const LobbyData &data)
         }
         return std::unexpected(StoreError::Unknown);
     }
-
-    if (m_lobbyListener->hasAlreadyObserver(data.lobby_name))
-        return {};
-    std::shared_ptr<Lobby> lobby = std::make_shared<Lobby>(data);
-    m_lobbyListener->addObserver(std::move(lobby));
-    return {};
 }
 
 std::expected<void, StoreError> LobbyStore::appendHistory(const std::string &lobbyName, const std::vector<ChatMessage> &newMessages)
@@ -163,6 +165,8 @@ std::expected<void, StoreError> LobbyStore::appendHistory(const std::string &lob
     {
         return std::unexpected(StoreError::FileOpenFailed);
     }
+    std::error_code permEc;
+    std::filesystem::permissions(filePath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, permEc);
 
     try
     {
@@ -236,6 +240,7 @@ void LobbyStore::updateLobbyData(const std::string &lobbyName, std::shared_ptr<L
     SPDLOG_DEBUG("updateLobbyData for lobby {}: {}", lobbyName, logPatch.dump());
 
     bool metadataChanged = false;
+    bool hasNewMessage = false;
     for (auto it = jsonPatch.begin(); it != jsonPatch.end(); ++it)
     {
         if (it.key() == "new_message")
@@ -253,10 +258,8 @@ void LobbyStore::updateLobbyData(const std::string &lobbyName, std::shared_ptr<L
             auto res = appendHistory(lobbyName, {msg});
             if (!res)
                 SPDLOG_ERROR("Failed to append history: {}", storeErrorToString(res.error()));
-        }
-        else if (it.key() == "message_sent_confirm" || it.key() == "message_resynced")
-        {
-            metadataChanged = true;
+            else
+                hasNewMessage = true;
         }
         else
         {
@@ -264,9 +267,9 @@ void LobbyStore::updateLobbyData(const std::string &lobbyName, std::shared_ptr<L
         }
     }
 
-    if (metadataChanged)
+    if (metadataChanged || hasNewMessage)
     {
-        auto data = observer->getLobbyData();
+        auto data = observer->getLobbyDataWithoutHistory();
         auto res = saveLobbyData(data);
         if (!res)
             SPDLOG_ERROR("Failed to save lobby metadata: {}", storeErrorToString(res.error()));
@@ -351,7 +354,19 @@ std::expected<LobbyData, StoreError> LobbyStore::loadLobbyDataFromFile(const std
                         try
                         {
                             nlohmann::json msgJson = nlohmann::json::parse(msgJsonStr);
-                            lobbyData.history.messages.push_back(msgJson.get<ChatMessage>());
+                            auto parsedMsg = msgJson.get<ChatMessage>();
+                            lobbyData.history.messages.push_back(parsedMsg);
+                            if (parsedMsg.direction == MessageDirection::IN && parsedMsg.seq_num > 0)
+                            {
+                                if (!lobbyData.downloaded_seq_nums.acknowledges(static_cast<std::uint64_t>(parsedMsg.seq_num)))
+                                {
+                                    lobbyData.downloaded_seq_nums.selective.push_back(static_cast<std::uint64_t>(parsedMsg.seq_num));
+                                }
+                            }
+                            else if (parsedMsg.direction == MessageDirection::OUT && parsedMsg.seq_num > lobbyData.my_seq_num)
+                            {
+                                lobbyData.my_seq_num = parsedMsg.seq_num;
+                            }
                         }
                         catch (const std::exception &e)
                         {
@@ -359,6 +374,7 @@ std::expected<LobbyData, StoreError> LobbyStore::loadLobbyDataFromFile(const std
                         }
                     }
                 }
+                lobbyData.downloaded_seq_nums.compress();
             }
         }
 
@@ -400,20 +416,15 @@ std::shared_ptr<LobbyObserver> LobbyStore::getLobby(const std::string &lobbyName
 
 std::shared_ptr<LobbyObserver> LobbyStore::getOrCreateLobby(const std::string &lobbyName)
 {
-    auto observer = getLobby(lobbyName);
-    if (observer)
-        return observer;
-
-    SPDLOG_INFO("Creating new lobby: {}", lobbyName);
-
-    LobbyData lobbyData;
-    lobbyData.lobby_name = lobbyName;
-    auto lobby = std::make_shared<Lobby>(lobbyData);
-    m_lobbyListener->addObserver(lobby);
-    return lobby;
+    return m_lobbyListener->getOrCreateObserver(lobbyName, [&]() {
+        SPDLOG_INFO("Creating new lobby: {}", lobbyName);
+        LobbyData lobbyData;
+        lobbyData.lobby_name = lobbyName;
+        return std::make_shared<Lobby>(lobbyData);
+    });
 }
 
-const std::vector<std::shared_ptr<LobbyObserver>>& LobbyStore::getLobbies()
+std::vector<std::shared_ptr<LobbyObserver>> LobbyStore::getLobbies()
 {
     return m_lobbyListener->getObservers();
 }
@@ -463,6 +474,9 @@ void LobbyStore::updateMasterPassword(const std::string &newPassword)
                 }
                 throw std::runtime_error("Failed to close new vault.tmp");
             }
+
+            std::error_code permEc;
+            std::filesystem::permissions(tmpVaultPath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, permEc);
 
             // Atomic rename guarantees the old vault is overwritten safely
             std::filesystem::rename(tmpVaultPath, vaultPath);

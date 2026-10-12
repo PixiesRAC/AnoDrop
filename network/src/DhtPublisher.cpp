@@ -8,6 +8,10 @@
 #include "CryptoUtils.h"
 #include "Dropper.h"
 #include "HandshakeStateEngine.h"
+#include "DhtSignalingService.h"
+#include "DhtChatUtils.h"
+#include "DhtMessageCodec.h"
+#include "TimeUtils.h"
 
 DhtPublisher::~DhtPublisher()
 {
@@ -20,6 +24,12 @@ void DhtPublisher::shutdown()
     // running tasks to finish. It prevents Use-After-Free of any captured
     // references (e.g. from LobbyFetcher handlers).
     m_networkWorker.shutdown();
+
+    // Explicitly shut down alert thread and callbacks in DhtManager
+    if (m_dhtManager)
+    {
+        m_dhtManager->shutdown();
+    }
 
     // Explicitly destroy the DhtManager (and its alert thread) AFTER
     // so no active network tasks try to access a destroyed libtorrent session.
@@ -39,7 +49,7 @@ void DhtPublisher::enqueueChatMessage(const struct ChatPublishParams &params)
 
 HandshakeKeyService::ChannelKeys DhtPublisher::deriveChannelKeys(const std::string &passphrase)
 {
-    std::vector<unsigned char> seed = CryptoUtils::deriveHKDF(std::vector<unsigned char>(passphrase.begin(), passphrase.end()), {}, "DHTSeed", 32).value_or(std::vector<unsigned char>());
+    std::vector<unsigned char> seed = network::DhtMessageCodec::deriveSeed(passphrase);
     if (seed.empty())
     {
         SPDLOG_ERROR("Failed to derive seed");
@@ -51,8 +61,8 @@ HandshakeKeyService::ChannelKeys DhtPublisher::deriveChannelKeys(const std::stri
 
     HandshakeKeyService::ChannelKeys info(seed, salt);
 
-    SPDLOG_INFO("Public Key (Hex): {}", info.pubKeyHex);
-    SPDLOG_INFO("Target ID (SHA-1): {}", info.targetIDHex);
+    SPDLOG_DEBUG("Public Key (Hex): {}", info.pubKeyHex);
+    SPDLOG_DEBUG("Target ID (SHA-1): {}", info.targetIDHex);
 
     return info;
 }
@@ -78,7 +88,7 @@ void DhtPublisher::dispatchHandshakeMessage(const std::string &lobbyName, const 
 
     std::string encryptedMessage(ciphertext.begin(), ciphertext.end());
 
-    std::vector<unsigned char> seed = CryptoUtils::deriveHKDF(std::vector<unsigned char>(lobbyName.begin(), lobbyName.end()), {}, "DHTSeed", 32).value_or(std::vector<unsigned char>());
+    std::vector<unsigned char> seed = network::DhtMessageCodec::deriveSeed(lobbyName);
     if (seed.empty())
     {
         SPDLOG_ERROR("Failed to derive seed");
@@ -90,50 +100,6 @@ void DhtPublisher::dispatchHandshakeMessage(const std::string &lobbyName, const 
     dropper.dropHandShakeMessage(encryptedMessage, lobbyName, m_dhtManager->getLobbyStore(), m_dhtManager.get());
 }
 
-bool DhtPublisher::waitForPutHandshakeConfirmed(const std::string &lobbyName, int timeoutSeconds)
-{
-    if (m_dhtManager)
-    {
-        return m_dhtManager->waitForPutHandshakeConfirmed(lobbyName, timeoutSeconds);
-    }
-    return false;
-}
-
-void DhtPublisher::dropAnomalyMessage(const std::string &message, const std::string &lobbyName)
-{
-    if (!m_dhtManager)
-    {
-        return;
-    }
-
-    HandshakeKeyService::ChannelKeys keys = deriveChannelKeys(lobbyName);
-    Dropper dropper(m_dhtManager->getSession(), keys.publicKey, keys.privateKey);
-    dropper.dropAnomalyMessage(message, lobbyName);
-}
-
-void DhtPublisher::dropHeartbeatMessage(int offsetSeconds, const std::string &lobbyName, const std::string &heartbeatKey)
-{
-    if (!m_dhtManager)
-    {
-        return;
-    }
-
-    HandshakeKeyService::ChannelKeys keys = deriveChannelKeys(heartbeatKey);
-    Dropper dropper(m_dhtManager->getSession(), keys.publicKey, keys.privateKey);
-    dropper.dropHeartbeatMessage(offsetSeconds, lobbyName);
-}
-
-void DhtPublisher::dropAckMessage(const std::string &message, const std::string &lobbyName, const std::string &ackKey, int offsetSeconds)
-{
-    if (!m_dhtManager)
-    {
-        return;
-    }
-
-    HandshakeKeyService::ChannelKeys keys = deriveChannelKeys(ackKey);
-    Dropper dropper(m_dhtManager->getSession(), keys.publicKey, keys.privateKey);
-    dropper.dropAckMessage(message, lobbyName, offsetSeconds);
-}
 
 void DhtPublisher::publishChatMessage(const ChatPublishParams &params)
 {
@@ -144,7 +110,7 @@ void DhtPublisher::publishChatMessage(const ChatPublishParams &params)
     }
 
     // 1. Update sequence target key with the new seq num
-    std::vector<unsigned char> seqSeed = CryptoUtils::deriveHKDF(std::vector<unsigned char>(params.sequenceTargetKey.begin(), params.sequenceTargetKey.end()), {}, "DHTSeed", 32).value_or(std::vector<unsigned char>());
+    std::vector<unsigned char> seqSeed = network::DhtMessageCodec::deriveSeed(params.sequenceTargetKey);
     if (seqSeed.empty())
     {
         SPDLOG_ERROR("Failed to derive seed");
@@ -155,7 +121,7 @@ void DhtPublisher::publishChatMessage(const ChatPublishParams &params)
     if (seqDropper.dropChatMessage(params, true))
     {
         // 2. Drop the actual message to the message target key
-        std::vector<unsigned char> msgSeed = CryptoUtils::deriveHKDF(std::vector<unsigned char>(params.messageTargetKey.begin(), params.messageTargetKey.end()), {}, "DHTSeed", 32).value_or(std::vector<unsigned char>());
+        std::vector<unsigned char> msgSeed = network::DhtMessageCodec::deriveSeed(params.messageTargetKey);
         if (msgSeed.empty())
         {
             SPDLOG_ERROR("Failed to derive seed");
@@ -174,7 +140,7 @@ void DhtPublisher::fetchDhtItem(const std::string &rawKeyString, std::shared_ptr
         return;
     }
 
-    std::string lobbyName = lobbyObs->getLobbyData().lobby_name;
+    std::string lobbyName = lobbyObs->getLobbyName();
     auto lobbyStore = m_dhtManager->getLobbyStore();
 
     auto callback = [this, lobbyObs, lobbyStore, isSeqNum, seqNumTarget, lobbyName](const lt::dht_mutable_item_alert *get_mut)
@@ -199,17 +165,17 @@ void DhtPublisher::fetchDhtItem(const std::string &rawKeyString, std::shared_ptr
 
 void DhtPublisher::handleDhtItemCallback(std::shared_ptr<LobbyObserver> lobbyObs, std::shared_ptr<LobbyStore> lobbyStore, bool isSeqNum, std::int64_t seqNumTarget, bool isUndefined, const std::string &valueStr, std::int64_t dhtSeq)
 {
-    LobbyData lobbyData = lobbyObs->getLobbyData();
-
-    if (lobbyData.is_hidden)
+    if (lobbyObs->getMetadata().is_hidden)
     {
-        SPDLOG_INFO("Ignoring DHT callback because lobby '{}' is hidden.", lobbyData.lobby_name);
+        SPDLOG_INFO("Ignoring DHT callback because lobby '{}' is hidden.", lobbyObs->getLobbyName());
         if (isSeqNum)
         {
             lobbyObs->clearFetchingSeq();
         }
         return;
     }
+
+    LobbyData lobbyData = lobbyObs->getLobbyDataWithoutHistory();
 
     if (isSeqNum)
     {
@@ -255,20 +221,31 @@ void DhtPublisher::processMessagePayloadCallback(const LobbyData &lobbyData, std
     }
     SPDLOG_INFO("Received chat message payload from DHT!");
 
-    ChatMessage chatMsg;
-    try
+    auto parsedMsg = network::DhtMessageCodec::parseChatMessage(valueStr, seqNumTarget);
+    if (!parsedMsg)
     {
-        nlohmann::json msgJson = nlohmann::json::parse(valueStr);
-        chatMsg = msgJson.get<ChatMessage>();
-        chatMsg.direction = MessageDirection::IN;
+        SPDLOG_WARN("{}. Ignored.", parsedMsg.error());
+        return;
     }
-    catch (const std::exception &e)
+    ChatMessage chatMsg = *parsedMsg;
+
+    // Check for already downloaded seq_num
+    if (lobbyData.downloaded_seq_nums.acknowledges(static_cast<std::uint64_t>(seqNumTarget)))
     {
-        SPDLOG_WARN("Failed to parse incoming ChatMessage JSON: {}. Ignored.", e.what());
-        return; // Fallback removed for security
+        SPDLOG_DEBUG("Message seq {} already downloaded in lobby '{}'. Ignoring duplicate.", seqNumTarget, lobbyData.lobby_name);
+        return;
     }
 
-    chatMsg.seq_num = seqNumTarget;
+    // Validate fake_timestamp from peer using DhtMessageCodec: check for corruption/invalid time
+    if (!network::DhtMessageCodec::isTimestampValid(chatMsg.fake_timestamp))
+    {
+        std::string anomalyMsg = "Corrupted timestamp received from peer";
+        SPDLOG_WARN("Corrupted/extreme fake_timestamp ({}) received in lobby '{}' for seq {}. Setting to ANOMALY.",
+                    chatMsg.fake_timestamp, lobbyData.lobby_name, seqNumTarget);
+
+        DhtSignalingService::signalAndPersistAnomaly(this, lobbyData.lobby_name, anomalyMsg, lobbyStore, lobbyObs);
+        return;
+    }
 
     nlohmann::json patch;
     patch["new_message"] = chatMsg;
@@ -287,8 +264,10 @@ void DhtPublisher::fetchMissingMessages(std::int64_t maxSeq, const LobbyData &lo
 {
     int fetchCount = 0;
     auto now = std::chrono::steady_clock::now();
+    const std::int64_t throughSeq = static_cast<std::int64_t>(lobbyData.downloaded_seq_nums.through);
 
-    for (std::int64_t i = maxSeq; i >= 1 && fetchCount < m_maxConcurrentFetches; --i)
+    // Stop early at throughSeq: all sequences <= throughSeq are already contiguous and downloaded.
+    for (std::int64_t i = maxSeq; i > throughSeq && fetchCount < m_maxConcurrentFetches; --i)
     {
         if (!lobbyData.downloaded_seq_nums.acknowledges(i))
         {
@@ -304,8 +283,10 @@ void DhtPublisher::fetchMissingMessages(std::int64_t maxSeq, const LobbyData &lo
                 }
                 else
                 {
-                    // Exponential backoff: 10s * 2^(attempt-1). Max backoff ~42 mins.
-                    int backoffSeconds = 10 * (1 << std::min(it->second.attemptCount - 1, 8));
+                    // Exponential backoff: 10s * 2^(attempt-1), capped at 42 seconds max.
+                    constexpr int MAX_BACKOFF_SECONDS = 42;
+                    int exponent = std::min(it->second.attemptCount - 1, 5);
+                    int backoffSeconds = std::min(10 * (1 << exponent), MAX_BACKOFF_SECONDS);
                     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.lastAttempt).count();
                     if (elapsed >= backoffSeconds)
                     {
@@ -331,6 +312,19 @@ void DhtPublisher::fetchMissingMessages(std::int64_t maxSeq, const LobbyData &lo
             m_missingFetchAttempts[lobbyData.lobby_name].erase(i);
         }
     }
+
+    // Cleanup: purge any attempts for sequences that are now fully downloaded (<= throughSeq)
+    {
+        std::lock_guard<std::mutex> lock(m_fetchAttemptsMutex);
+        auto itAttempts = m_missingFetchAttempts.find(lobbyData.lobby_name);
+        if (itAttempts != m_missingFetchAttempts.end())
+        {
+            std::erase_if(itAttempts->second, [throughSeq](const auto &pair) {
+                return pair.first <= throughSeq;
+            });
+        }
+    }
+
     if (fetchCount == m_maxConcurrentFetches)
     {
         SPDLOG_WARN("Resynchronization truncated at {} messages to prevent flooding. Run fetch again later.", m_maxConcurrentFetches);

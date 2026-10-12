@@ -27,7 +27,7 @@ struct SaltParams
 
     // Serializes the structure into raw bytes in Little-Endian format:
     // logicalSize || version || domainId || keyPurpose || epochMarker || extraValue
-    std::vector<uint8_t> serialize() const
+    [[nodiscard]] std::vector<uint8_t> serialize() const
     {
         std::vector<uint8_t> result;
 

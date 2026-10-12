@@ -1,6 +1,7 @@
 #include "ChangePasswordView.h"
 
 #include <ncurses.h>
+#include <openssl/crypto.h>
 
 namespace ui
 {
@@ -14,12 +15,14 @@ void ChangePasswordView::show()
     mvprintw(2, 4, "=== Change Master Password ===");
     mvprintw(4, 4, "Enter new Master Password: ");
 
+    noecho();
     curs_set(1);
     char pwdBuf[256];
     getnstr(pwdBuf, 255);
     curs_set(0);
 
     std::string newPwd(pwdBuf);
+    OPENSSL_cleanse(pwdBuf, sizeof(pwdBuf));
     if (newPwd.empty())
     {
         mvprintw(6, 4, "Password cannot be empty! Aborting.");

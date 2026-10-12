@@ -14,19 +14,14 @@ class DhtPublisher
 
     void setDhtManager(std::unique_ptr<DhtManager> dhtManager);
 
-    HandshakeKeyService::ChannelKeys deriveChannelKeys(const std::string &passphrase);
+    [[nodiscard]] HandshakeKeyService::ChannelKeys deriveChannelKeys(const std::string &passphrase);
 
     void dispatchHandshakeMessage(const std::string &lobbyName, const std::string &pseudo);
-    void dropAnomalyMessage(const std::string &message, const std::string &lobbyName);
-    void dropHeartbeatMessage(int offsetSeconds, const std::string &lobbyName, const std::string &heartbeatKey);
-    void dropAckMessage(const std::string &message, const std::string &lobbyName, const std::string &ackKey, int offsetSeconds);
     void publishChatMessage(const struct ChatPublishParams &params);
     void enqueueChatMessage(const struct ChatPublishParams &params);
-    bool waitForPutHandshakeConfirmed(const std::string &context = "", int timeoutSeconds = 60);
     void fetchDhtItem(const std::string &rawKeyString, std::shared_ptr<LobbyObserver> lobbyObs, bool isSeqNum, std::int64_t seqNumTarget = -1);
 
-
-    DhtManager *getDhtManager() const
+    [[nodiscard]] DhtManager *getDhtManager() const
     {
         return m_dhtManager.get();
     }
@@ -41,7 +36,7 @@ class DhtPublisher
         m_maxConcurrentFetches = maxFetches;
     }
 
-    int getMaxConcurrentFetches() const
+    [[nodiscard]] int getMaxConcurrentFetches() const
     {
         return m_maxConcurrentFetches;
     }

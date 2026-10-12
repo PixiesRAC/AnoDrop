@@ -2,32 +2,39 @@
 
 #include "DhtPublisher.h"
 
+class NetworkResyncHandler;
+class DhtChatHandler;
+
 class AppFacade
 {
   public:
-    AppFacade(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore);
+    AppFacade(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore, bool autoPullMessages = false);
     ~AppFacade();
 
-    std::vector<std::shared_ptr<LobbyObserver>> getLobbies() const;
+    void shutdown();
+
+    [[nodiscard]] std::vector<std::shared_ptr<LobbyObserver>> getLobbies() const;
     void updateMasterPassword(const std::string &newPassword);
-    HandshakeKeyService::ChannelKeys initiateHandshake(const std::string &passphrase, const std::string &pseudo);
+    [[nodiscard]] HandshakeKeyService::ChannelKeys initiateHandshake(const std::string &passphrase, const std::string &pseudo);
     void synchronizeAllActiveLobbies();
     void synchronizeAndProcessNewIncomingMessage(std::shared_ptr<LobbyObserver> lobbyObs);
     void hideLobby(const std::string &lobbyName);
     bool unhideLobbyIfExists(const std::string &lobbyName);
-    void sendMessage(const std::string &lobbyName, const std::string &content);
     void flagAnomaly(const std::string &lobbyName, const std::string &message);
 
-    std::shared_ptr<LobbyStore> getLobbyStore() const { return m_lobbyStore; }
-    std::shared_ptr<DhtPublisher> getDhtPublisher() const { return m_dhtPublisher; }
+    [[nodiscard]] DhtChatHandler *getChatHandler() const { return m_chatHandler.get(); }
 
   private:
     void syncThreadLoop(std::stop_token stoken);
 
     std::shared_ptr<DhtPublisher> m_dhtPublisher;
     std::shared_ptr<LobbyStore> m_lobbyStore;
+    std::unique_ptr<NetworkResyncHandler> m_networkResyncer;
+    std::unique_ptr<DhtChatHandler> m_chatHandler;
 
     std::jthread m_syncThread;
-    std::mutex m_syncMutex;
+    mutable std::mutex m_syncMutex;
+    std::condition_variable_any m_syncCv;
     std::vector<std::shared_ptr<LobbyObserver>> m_activeSyncLobbies;
+    bool m_autoPullMessages;
 };

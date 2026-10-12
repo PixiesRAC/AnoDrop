@@ -12,5 +12,7 @@
   // Global cryptographic salt for Lobby hashing (all clients must use the same to find each other)
   "extra_salt_data_for_lobby_handshake": "AnoDrop",
   // Log verbosity level (Possible values: "trace", "debug", "info", "warn", "err", "critical", "off")
-  "log_level": "info"
+  "log_level": "info",
+  // Network interface to bind exclusively (KillSwitch). Values: "any" (no binding), or explicit name like "nordlynx", "tun0", "wg0"
+  "network_interface": "any"
 }

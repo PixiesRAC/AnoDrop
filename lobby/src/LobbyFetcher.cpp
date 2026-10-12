@@ -4,17 +4,13 @@
 #include <spdlog/spdlog.h>
 
 LobbyFetcher::LobbyFetcher(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore, int fetchInterval)
-    : m_lobbyStore(lobbyStore), m_fetchInterval(fetchInterval), m_dhtPublisher(dhtPublisher), anomalyHandler(dhtPublisher), heartbeatHandler(dhtPublisher), ackHandler(dhtPublisher)
+    : m_context(std::make_shared<Context>(dhtPublisher, lobbyStore)), m_fetchInterval(fetchInterval)
 {
 }
 
 LobbyFetcher::~LobbyFetcher()
 {
-    if (m_fetchThread.joinable())
-    {
-        m_fetchThread.request_stop();
-        m_fetchThread.join();
-    }
+    stop();
 }
 
 void LobbyFetcher::ProcessLobbies()
@@ -27,16 +23,21 @@ void LobbyFetcher::ProcessLobbies()
 void LobbyFetcher::stop()
 {
     m_fetchThread.request_stop();
+    m_loopCv.notify_all();
+    if (m_fetchThread.joinable())
+    {
+        m_fetchThread.join();
+    }
 }
 
 void LobbyFetcher::fetchLoop(std::stop_token stoken)
 {
-    std::mutex cv_m;
-    std::condition_variable_any cv;
-
     while (!stoken.stop_requested())
     {
-        auto lobbies = m_lobbyStore->getLobbies();
+        if (!m_context || !m_context->lobbyStore)
+            break;
+
+        auto lobbies = m_context->lobbyStore->getLobbies();
         auto now = std::chrono::steady_clock::now();
 
         for (const auto &lobby : lobbies)
@@ -44,7 +45,7 @@ void LobbyFetcher::fetchLoop(std::stop_token stoken)
             std::string lobbyName = lobby->getLobbyName();
             std::string taskName = lobbyName;
 
-            if (lobby->getLobbyData().status == LobbyStatus::PENDING_HANDSHAKE)
+            if (lobby->getStatus() == LobbyStatus::PENDING_HANDSHAKE)
             {
                 bool scheduleNext = false;
                 bool executeNow = false;
@@ -66,19 +67,26 @@ void LobbyFetcher::fetchLoop(std::stop_token stoken)
                     int jitter = jitter_dist(gen);
 
                     int personal_offset = 0;
-                    if (lobby->getLobbyData().my_x25519_pub.length() >= 2)
-                    {
-                        int firstByte = std::stoi(lobby->getLobbyData().my_x25519_pub.substr(0, 2), nullptr, 16);
-                        personal_offset = firstByte * 12;
-                    }
+                    lobby->withDataView([&personal_offset](const LobbyMetadata &, const LobbySyncState &, const LobbyCryptoVault &crypto) {
+                        if (crypto.my_x25519_pub.length() >= 2)
+                        {
+                            try {
+                                int firstByte = std::stoi(crypto.my_x25519_pub.substr(0, 2), nullptr, 16);
+                                personal_offset = firstByte * 12;
+                            } catch (...) {}
+                        }
+                    });
                     int total_delay = m_fetchInterval + personal_offset + jitter;
                     m_nextHandshakeAttempt[lobbyName] = now + std::chrono::milliseconds(total_delay);
 
-                    if (executeNow)
+                    if (executeNow && m_context->dhtPublisher)
                     {
                         SPDLOG_INFO("LobbyFetcher: Executing handshake for '{}' (Next attempt in {} ms)", lobbyName, total_delay);
-                        m_dhtPublisher->enqueueNetworkTask(taskName, [this, name = std::move(lobbyName)]()
-                                                           { this->processLobby(name); });
+                        m_context->dhtPublisher->enqueueNetworkTask(taskName, [weakCtx = std::weak_ptr<Context>(m_context), name = std::move(lobbyName)]() {
+                            auto ctx = weakCtx.lock();
+                            if (ctx)
+                                ctx->processLobby(name);
+                        });
                     }
                     else
                     {
@@ -86,56 +94,68 @@ void LobbyFetcher::fetchLoop(std::stop_token stoken)
                     }
                 }
             }
-            else
+            else if (m_context->dhtPublisher)
             {
-                // No mutex is necessary here or in the callback because PartitionedThreadPool
-                // guarantees sequential execution for tasks with the same partition key (lobbyName).
-                m_dhtPublisher->enqueueNetworkTask(taskName, [this, name = std::move(lobbyName)]()
-                                                   { this->processLobby(name); });
+                m_context->dhtPublisher->enqueueNetworkTask(taskName, [weakCtx = std::weak_ptr<Context>(m_context), name = std::move(lobbyName)]() {
+                    auto ctx = weakCtx.lock();
+                    if (ctx)
+                        ctx->processLobby(name);
+                });
             }
         }
 
-        std::unique_lock<std::mutex> cv_lock(cv_m);
-        cv.wait_for(cv_lock, stoken, std::chrono::milliseconds(ESTABLISHED_LOBBY_FETCH_INTERVAL_MS), []
+        std::unique_lock<std::mutex> cv_lock(m_loopMutex);
+        m_loopCv.wait_for(cv_lock, stoken, std::chrono::milliseconds(ESTABLISHED_LOBBY_FETCH_INTERVAL_MS), []
                     { return false; });
     }
 }
 
-void LobbyFetcher::processLobby(std::string lobbyName)
+void LobbyFetcher::Context::processLobby(const std::string &lobbyName)
 {
-    auto observer = m_lobbyStore->getLobby(lobbyName);
+    if (!lobbyStore || !dhtPublisher)
+        return;
+
+    auto observer = lobbyStore->getLobby(lobbyName);
 
     if (!observer)
     {
         return;
     }
-    LobbyData currentLobby = observer->getLobbyData();
-    if (currentLobby.is_hidden)
+    if (observer->getMetadata().is_hidden)
     {
         return;
     }
 
-    switch (currentLobby.status)
+    LobbyStatus currentStatus = observer->getStatus();
+    switch (currentStatus)
     {
     case LobbyStatus::PENDING_HANDSHAKE:
-        m_dhtPublisher->dispatchHandshakeMessage(lobbyName, currentLobby.my_pseudo);
-        // We do NOT block here with waitForPutHandshakeConfirmed. Blocking the worker thread
-        // prevents PartitionedThreadPool from processing chat messages for other lobbies sharing this thread.
+        dhtPublisher->dispatchHandshakeMessage(lobbyName, observer->getMetadata().my_pseudo);
         break;
     case LobbyStatus::HANDSHAKE_DONE:
     case LobbyStatus::ANOMALY:
     {
+        LobbyData currentLobby = observer->getLobbyDataWithoutHistory();
         auto now = std::chrono::steady_clock::now();
-        if (m_lastStatusCheck.find(lobbyName) == m_lastStatusCheck.end() || std::chrono::duration_cast<std::chrono::seconds>(now - m_lastStatusCheck[lobbyName]).count() >= STATUS_CHECK_INTERVAL_SEC)
+        bool shouldCheck = false;
         {
-            m_lastStatusCheck[lobbyName] = now;
-            anomalyHandler.checkLobbyAnomaly(lobbyName, m_lobbyStore);
+            std::lock_guard<std::mutex> lock(statusCheckMutex);
+            if (lastStatusCheck.find(lobbyName) == lastStatusCheck.end() || std::chrono::duration_cast<std::chrono::seconds>(now - lastStatusCheck[lobbyName]).count() >= STATUS_CHECK_INTERVAL_SEC)
+            {
+                lastStatusCheck[lobbyName] = now;
+                shouldCheck = true;
+            }
+        }
+
+        if (shouldCheck)
+        {
+            anomalyHandler.checkLobbyAnomaly(lobbyName, lobbyStore);
             heartbeatHandler.dispatchHeartbeatMessage(currentLobby);
-            heartbeatHandler.checkLobbyHeartbeat(currentLobby, m_lobbyStore);
+            heartbeatHandler.checkLobbyHeartbeat(currentLobby, lobbyStore);
         }
 
         ackHandler.pushAcks(currentLobby);
-        ackHandler.fetchPeerAcks(currentLobby, m_lobbyStore);
+        ackHandler.fetchPeerAcks(currentLobby, lobbyStore);
         break;
     }
     default:

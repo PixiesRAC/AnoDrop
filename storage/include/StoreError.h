@@ -12,7 +12,7 @@ enum class StoreError
     Unknown
 };
 
-inline std::string storeErrorToString(StoreError error)
+[[nodiscard]] inline std::string storeErrorToString(StoreError error)
 {
     switch (error)
     {

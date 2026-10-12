@@ -9,11 +9,10 @@ namespace ui
 class LobbiesView : public IView
 {
   public:
-    LobbiesView(std::shared_ptr<AppFacade> appFacade, DhtChatHandler *chatHandler);
+    explicit LobbiesView(std::shared_ptr<AppFacade> appFacade);
     void show() override;
 
   private:
     std::shared_ptr<AppFacade> m_appFacade;
-    DhtChatHandler *m_chatHandler;
 };
 } // namespace ui

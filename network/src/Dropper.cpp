@@ -1,16 +1,17 @@
-#include <nlohmann/json.hpp>
-#include "LobbyDataSerializer.h"
 #include "Dropper.h"
 
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/hasher.hpp>
 #include <libtorrent/kademlia/item.hpp>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "Bep44Signer.h"
 #include "DhtManager.h"
 #include "HandshakePayloadCodec.h"
 #include "HandshakeStateEngine.h"
 #include "Hasher.h"
+#include "LobbyDataSerializer.h"
 
 Dropper::Dropper(lt::session *session, const std::array<char, 32> &publicKey, const std::array<char, 64> &privateKey) : m_session(session), m_publicKey(publicKey), m_privateKey(privateKey)
 {
@@ -21,110 +22,29 @@ Dropper::~Dropper()
     SPDLOG_INFO("~Dropper: destroying Dropper...");
 }
 
+static void signAndPackMutableItem(const std::string &payload, std::int64_t seqNum, const std::array<char, 32> &publicKey, const std::array<char, 64> &privateKey, lt::entry &dhtMutableItem, std::array<char, 64> &dhtSignature, std::int64_t &dhtSequenceNumber, const std::string &dhtSalt)
+{
+    network::Bep44Signer::signAndPackMutableItem(payload, seqNum, publicKey, privateKey, dhtMutableItem, dhtSignature, dhtSequenceNumber, dhtSalt);
+}
+
 static void put_mutable_callback_handshake(const std::string &ourEncryptedPayload, const std::string &lobbyName, std::shared_ptr<LobbyStore> lobbyStore, const std::array<char, 32> &publicKey, const std::array<char, 64> &privateKey, lt::entry &dhtMutableItem, std::array<char, 64> &dhtSignature, std::int64_t &dhtSequenceNumber, std::string const &dhtSalt)
 {
-    auto ourDecryptedPayload = HandshakePayloadCodec::decryptDhtHandShakePayload(ourEncryptedPayload, lobbyName);
-    if (!ourDecryptedPayload || !ourDecryptedPayload->is_array() || ourDecryptedPayload->empty())
+    bool hasExisting = (dhtSequenceNumber > 0 && dhtMutableItem.type() == lt::entry::string_t);
+    std::string existingItemStr = hasExisting ? dhtMutableItem.string() : "";
+
+    auto transition = HandshakeStateEngine::processHandshakeTransition(
+        ourEncryptedPayload, lobbyName, lobbyStore, dhtSequenceNumber, existingItemStr, hasExisting);
+
+    if (!transition.shouldWrite)
     {
-        SPDLOG_ERROR("Dropper callback: our own payload is invalid");
         return;
     }
 
-    auto ourPeerInfo = (*ourDecryptedPayload)[0];
-
-    [[maybe_unused]] bool shouldWrite = true;
-    bool isHandshakeDone = false;
-    std::string finalEncryptedPayload = ourEncryptedPayload;
-
-    if (dhtSequenceNumber > 0 && dhtMutableItem.type() == lt::entry::string_t)
-    {
-        if (dhtSequenceNumber >= INT64_MAX - 2)
-        {
-            SPDLOG_INFO("Handshake is done for both parties of lobby {}", lobbyName);
-            isHandshakeDone = true;
-        }
-        auto existingDecryptedPayload = HandshakePayloadCodec::decryptDhtHandShakePayload(dhtMutableItem.string(), lobbyName);
-
-        if (!existingDecryptedPayload)
-        {
-            SPDLOG_WARN("Lobby {} payload is corrupted. Set to ANOMALY.", lobbyName);
-            if (lobbyStore)
-                lobbyStore->asyncUpdateLobbyData(lobbyName, {{"status", LobbyStatus::ANOMALY}});
-            return;
-        }
-        if (lobbyStore)
-        {
-            nlohmann::json resolvedPatch = HandshakeStateEngine::resolvePayload(*existingDecryptedPayload, lobbyName, lobbyStore);
-            if (!resolvedPatch.empty())
-            {
-                // Timezone adoption logic:
-                // The person who set SEQ_MAX first (the initiator) keeps their own timezone.
-                // The late participant (who sees isHandshakeDone = true) adopts the initiator's timezone.
-                if (isHandshakeDone && resolvedPatch.contains("peer_fake_timezone"))
-                {
-                    FakeTimezone peerTz = resolvedPatch["peer_fake_timezone"].get<FakeTimezone>();
-                    resolvedPatch["fake_timezone"] = peerTz;
-                    SPDLOG_INFO("Adopting peer's fake timezone '{}' for lobby {} (they set SEQ_MAX first)", peerTz.name, lobbyName);
-                }
-
-                // Remove peer_fake_timezone from the patch — it's transient metadata, not a lobby field
-                resolvedPatch.erase("peer_fake_timezone");
-
-                lobbyStore->asyncUpdateLobbyData(lobbyName, resolvedPatch);
-
-                if (resolvedPatch.contains("status") && resolvedPatch["status"].get<int>() == static_cast<int>(LobbyStatus::HANDSHAKE_DONE))
-                {
-                    SPDLOG_INFO("Handshake complete for lobby {}. Setting seqNum to "
-                                "INT64_MAX - 1",
-                                lobbyName);
-                    dhtSequenceNumber = INT64_MAX - 2; // Will become INT64_MAX - 1 after the ++ below
-                }
-            }
-        }
-
-        if (!isHandshakeDone)
-        {
-            auto mergeRes = HandshakeStateEngine::mergeHandshakePayloads(*existingDecryptedPayload, ourPeerInfo, lobbyName);
-            if (mergeRes)
-            {
-                finalEncryptedPayload = std::string(mergeRes->begin(), mergeRes->end());
-            }
-        }
-        else
-        {
-            auto encRes = HandshakePayloadCodec::encryptDhtHandshakePayload(*existingDecryptedPayload, lobbyName);
-            if (encRes)
-            {
-                finalEncryptedPayload = std::string(encRes->begin(), encRes->end());
-            }
-        }
-    }
-
-    auto decryptedForLog = HandshakePayloadCodec::decryptDhtHandShakePayload(finalEncryptedPayload, lobbyName);
-    if (decryptedForLog)
-    {
-        SPDLOG_INFO("Sent DHT Handshake payload (decrypted): {} for lobby {}", decryptedForLog->dump(), lobbyName);
-    }
-
-    if (finalEncryptedPayload.size() > 1000)
-    {
-        SPDLOG_ERROR("Merged payload for lobby {} exceeds 1000 bytes ({}). Aborting.", lobbyName, finalEncryptedPayload.size());
-        return;
-    }
-
+    dhtSequenceNumber = transition.targetSequenceNumber - 1;
     SPDLOG_INFO("Current seqNum for {} is {}", lobbyName, dhtSequenceNumber);
-    dhtMutableItem = finalEncryptedPayload;
-    dhtSequenceNumber++;
-
-    size_t expectedBencodeSize = std::to_string(finalEncryptedPayload.size()).length() + 1 + finalEncryptedPayload.size();
-
-    std::vector<char> bencodedItem;
-    bencodedItem.reserve(expectedBencodeSize);
-    lt::bencode(std::back_inserter(bencodedItem), dhtMutableItem);
-
-    lt::dht::signature generatedSignature = lt::dht::sign_mutable_item(bencodedItem, dhtSalt, lt::dht::sequence_number(dhtSequenceNumber), lt::dht::public_key(publicKey.data()), lt::dht::secret_key(privateKey.data()));
-
-    dhtSignature = generatedSignature.bytes;
+    network::Bep44Signer::signAndPackMutableItem(
+        transition.payloadToWrite, transition.targetSequenceNumber, publicKey, privateKey,
+        dhtMutableItem, dhtSignature, dhtSequenceNumber, dhtSalt);
 }
 
 static std::string getLobbySalt(const std::string &lobbyName)
@@ -150,7 +70,8 @@ bool Dropper::dropHandShakeMessage(const std::string &message, const std::string
     }
     std::string targetIDHex = Util::toHex(h.final().to_string());
 
-    if (dhtManager) {
+    if (dhtManager)
+    {
         dhtManager->registerPendingPut(targetIDHex, lobbyName, 0);
     }
 
@@ -165,39 +86,13 @@ bool Dropper::dropHandShakeMessage(const std::string &message, const std::string
 
 static void put_mutable_callback_anomaly(const std::string &finalEncryptedPayload, const std::array<char, 32> &publicKey, const std::array<char, 64> &privateKey, lt::entry &dhtMutableItem, std::array<char, 64> &dhtSignature, std::int64_t &dhtSequenceNumber, std::string const &dhtSalt)
 {
-    dhtMutableItem = finalEncryptedPayload;
-    dhtSequenceNumber = INT64_MAX; // Force MAX for anomaly
-
-    size_t expectedBencodeSize = std::to_string(finalEncryptedPayload.size()).length() + 1 + finalEncryptedPayload.size();
-    std::vector<char> bencodedItem;
-    bencodedItem.reserve(expectedBencodeSize);
-    lt::bencode(std::back_inserter(bencodedItem), dhtMutableItem);
-
-    lt::dht::signature generatedSignature = lt::dht::sign_mutable_item(bencodedItem, dhtSalt, lt::dht::sequence_number(dhtSequenceNumber), lt::dht::public_key(publicKey.data()), lt::dht::secret_key(privateKey.data()));
-
-    dhtSignature = generatedSignature.bytes;
+    signAndPackMutableItem(finalEncryptedPayload, INT64_MAX, publicKey, privateKey, dhtMutableItem, dhtSignature, dhtSequenceNumber, dhtSalt); // Force MAX for anomaly
 }
 
 static void put_mutable_callback_heartbeat(const std::string &timestamp, std::int64_t fakeTimestamp, const std::array<char, 32> &publicKey, const std::array<char, 64> &privateKey, lt::entry &dhtMutableItem, std::array<char, 64> &dhtSignature, std::int64_t &dhtSequenceNumber, std::string const &dhtSalt)
 {
-    dhtMutableItem = timestamp;
-    if (fakeTimestamp > dhtSequenceNumber)
-    {
-        dhtSequenceNumber = fakeTimestamp;
-    }
-    else
-    {
-        dhtSequenceNumber++;
-    }
-
-    size_t expectedBencodeSize = std::to_string(timestamp.size()).length() + 1 + timestamp.size();
-    std::vector<char> bencodedItem;
-    bencodedItem.reserve(expectedBencodeSize);
-    lt::bencode(std::back_inserter(bencodedItem), dhtMutableItem);
-
-    lt::dht::signature generatedSignature = lt::dht::sign_mutable_item(bencodedItem, dhtSalt, lt::dht::sequence_number(dhtSequenceNumber), lt::dht::public_key(publicKey.data()), lt::dht::secret_key(privateKey.data()));
-
-    dhtSignature = generatedSignature.bytes;
+    std::int64_t targetSeq = (fakeTimestamp > dhtSequenceNumber) ? fakeTimestamp : (dhtSequenceNumber + 1);
+    signAndPackMutableItem(timestamp, targetSeq, publicKey, privateKey, dhtMutableItem, dhtSignature, dhtSequenceNumber, dhtSalt);
 }
 
 bool Dropper::dropAnomalyMessage(const std::string &message, const std::string &lobbyName)
@@ -250,22 +145,8 @@ bool Dropper::dropHeartbeatMessage(int offsetSeconds, const std::string &lobbyNa
 
 static void put_mutable_callback_ack(const std::string &dataToPut, std::int64_t fakeTimestamp, const std::array<char, 32> &publicKey, const std::array<char, 64> &privateKey, lt::entry &dhtMutableItem, std::array<char, 64> &dhtSignature, std::int64_t &dhtSequenceNumber, std::string const &dhtSalt)
 {
-    dhtMutableItem = dataToPut;
-    if (fakeTimestamp > dhtSequenceNumber)
-    {
-        dhtSequenceNumber = fakeTimestamp;
-    }
-    else
-    {
-        dhtSequenceNumber++;
-    }
-
-    size_t expectedBencodeSize = std::to_string(dataToPut.size()).length() + 1 + dataToPut.size();
-    std::vector<char> bencodedItem;
-    bencodedItem.reserve(expectedBencodeSize);
-    lt::bencode(std::back_inserter(bencodedItem), dhtMutableItem);
-    lt::dht::signature generatedSignature = lt::dht::sign_mutable_item(bencodedItem, dhtSalt, lt::dht::sequence_number(dhtSequenceNumber), lt::dht::public_key(publicKey.data()), lt::dht::secret_key(privateKey.data()));
-    dhtSignature = generatedSignature.bytes;
+    std::int64_t targetSeq = (fakeTimestamp > dhtSequenceNumber) ? fakeTimestamp : (dhtSequenceNumber + 1);
+    signAndPackMutableItem(dataToPut, targetSeq, publicKey, privateKey, dhtMutableItem, dhtSignature, dhtSequenceNumber, dhtSalt);
 }
 
 bool Dropper::dropAckMessage(const std::string &message, const std::string &lobbyName, int offsetSeconds)
@@ -293,17 +174,7 @@ bool Dropper::dropAckMessage(const std::string &message, const std::string &lobb
 // would produce 11 and be rejected. Using our own value guarantees correctness.
 static void put_mutable_callback_chat(const std::string &dataToPut, std::int64_t targetSeqNum, const std::array<char, 32> &publicKey, const std::array<char, 64> &privateKey, lt::entry &dhtMutableItem, std::array<char, 64> &dhtSignature, std::int64_t &dhtSequenceNumber, std::string const &dhtSalt)
 {
-    dhtMutableItem = dataToPut;
-    dhtSequenceNumber = targetSeqNum;
-
-    size_t expectedBencodeSize = std::to_string(dataToPut.size()).length() + 1 + dataToPut.size();
-    std::vector<char> bencodedItem;
-    bencodedItem.reserve(expectedBencodeSize);
-    lt::bencode(std::back_inserter(bencodedItem), dhtMutableItem);
-
-    lt::dht::signature generatedSignature = lt::dht::sign_mutable_item(bencodedItem, dhtSalt, lt::dht::sequence_number(dhtSequenceNumber), lt::dht::public_key(publicKey.data()), lt::dht::secret_key(privateKey.data()));
-
-    dhtSignature = generatedSignature.bytes;
+    signAndPackMutableItem(dataToPut, targetSeqNum, publicKey, privateKey, dhtMutableItem, dhtSignature, dhtSequenceNumber, dhtSalt);
 }
 
 bool Dropper::dropChatMessage(const ChatPublishParams &params, bool isSeqNumMsg, DhtManager *dhtManager)

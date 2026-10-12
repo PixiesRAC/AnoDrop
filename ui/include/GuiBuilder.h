@@ -16,15 +16,14 @@ class GuiBuilder
 
     void showLoadingScreen();
     void buildAndRun();
+    void shutdown();
+    static void resetTerminal();
 
   private:
     void showMainMenu();
 
     bool m_running;
     int m_selectedOption;
-    std::shared_ptr<DhtPublisher> m_dhtPublisher;
-    std::shared_ptr<LobbyStore> m_lobbyStore;
     std::shared_ptr<AppFacade> m_appFacade;
-    std::unique_ptr<::DhtChatHandler> m_chatHandler;
 };
 } // namespace ui

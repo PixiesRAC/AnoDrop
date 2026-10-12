@@ -10,6 +10,7 @@ class DhtManager;
 class Dropper
 {
     friend class DhtPublisher;
+    friend class DhtSignalingService;
 
   private:
     Dropper(lt::session *session, const std::array<char, 32> &publicKey, const std::array<char, 64> &privateKey);

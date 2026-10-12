@@ -33,10 +33,9 @@ int main(int argc, char *argv[])
 
     Config config(argc, argv);
     Logger::init(config.getLogPath(), config.getLogLevel());
-    
-    // Log all startup parameters
-    SPDLOG_INFO("Config: LogPath={}, LogLevel={}, StorePath={}, MaxConcurrentFetches={}, FetchInterval={}ms, PullMessagesOnStartup={}", 
-                config.getLogPath(), config.getLogLevel(), config.getStorePath(), 
+
+    SPDLOG_INFO("Config: LogPath={}, LogLevel={}, StorePath={}, NetworkInterface={}, MaxConcurrentFetches={}, FetchInterval={}ms, PullMessagesOnStartup={}", 
+                config.getLogPath(), config.getLogLevel(), config.getStorePath(), config.getNetworkInterface(),
                 config.getMaxConcurrentFetches(), config.getFetchInterval(), config.getPullMessagesOnStartup());
 
     Hasher::getInstance().setConfig(config);
@@ -65,7 +64,18 @@ int main(int argc, char *argv[])
         }
     }
 
-    std::unique_ptr<DhtManager> dhtManager = std::make_unique<DhtManager>();
+    std::unique_ptr<DhtManager> dhtManager;
+    try
+    {
+        dhtManager = std::make_unique<DhtManager>(config.getNetworkInterface());
+    }
+    catch (const std::exception &e)
+    {
+        SPDLOG_CRITICAL("Failed to initialize DHT Manager: {}", e.what());
+        gui.resetTerminal();
+        std::cerr << "\n\033[1;31m[AnoDrop KILLSWITCH ERROR] " << e.what() << "\033[0m\n\n";
+        return 1;
+    }
     dhtManager->setLobbyStore(lobbyStore);
     std::shared_ptr<DhtPublisher> dhtPublisher = std::make_shared<DhtPublisher>();
     dhtPublisher->setMaxConcurrentFetches(config.getMaxConcurrentFetches());
@@ -76,10 +86,9 @@ int main(int argc, char *argv[])
         dhtManager->waitUntilDhtIsReady();
         dhtPublisher->setDhtManager(std::move(dhtManager));
         
-        auto appFacade = std::make_unique<AppFacade>(dhtPublisher, lobbyStore);
+        auto appFacade = std::make_unique<AppFacade>(dhtPublisher, lobbyStore, config.getPullMessagesOnStartup());
         if (config.getPullMessagesOnStartup())
         {
-            // Pull messages on startup ensures that any missed messages while offline are retrieved
             SPDLOG_INFO("PullMessagesOnStartup is enabled: Synchronizing all active lobbies.");
             appFacade->synchronizeAllActiveLobbies();
         }
@@ -94,11 +103,12 @@ int main(int argc, char *argv[])
     std::unique_ptr<LobbyFetcher> lobbyStateFetcher = std::make_unique<LobbyFetcher>(dhtPublisher, lobbyStore, config.getFetchInterval());
 
     lobbyStateFetcher->ProcessLobbies();
-    gui.buildAndRun(); // loop
+    gui.buildAndRun();
 
     SPDLOG_INFO("Shutting down AnoDrop...");
     lobbyStateFetcher->stop();
-    dhtPublisher->shutdown(); // Stops DHT and all workers securely
-    SPDLOG_INFO("LobbyFetcher stopped. Cleaning up...");
+    gui.shutdown();
+    dhtPublisher->shutdown();
+    SPDLOG_INFO("AnoDrop shutdown completed cleanly.");
     return 0;
 }

@@ -8,7 +8,7 @@ namespace ui
 class Unlock
 {
   public:
-    static std::string askMasterPassword(const std::string& errorMessage = "");
+    [[nodiscard]] static std::string askMasterPassword(const std::string& errorMessage = "");
 };
 
 } // namespace ui

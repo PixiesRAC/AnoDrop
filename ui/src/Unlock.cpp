@@ -1,6 +1,7 @@
 #include "Unlock.h"
 
 #include <ncurses.h>
+#include <openssl/crypto.h>
 
 namespace ui
 {
@@ -22,7 +23,9 @@ std::string Unlock::askMasterPassword(const std::string& errorMessage)
     getnstr(pwdBuf, 255);
     curs_set(0);
 
-    return std::string(pwdBuf);
+    std::string pwd(pwdBuf);
+    OPENSSL_cleanse(pwdBuf, sizeof(pwdBuf));
+    return pwd;
 }
 
 } // namespace ui

@@ -10,7 +10,7 @@
 
 DhtChat::DhtChat(Lobby &lobby, std::shared_ptr<DhtPublisher> pub) : m_lobby(lobby), m_publisher(pub)
 {
-    SPDLOG_INFO("DhtChat: Creating chat for lobby {}", m_lobby.getLobbyData().lobby_name);
+    SPDLOG_INFO("DhtChat: Creating chat for lobby {}", m_lobby.getLobbyName());
     republishUnackedMessages();
 }
 
@@ -20,61 +20,72 @@ DhtChat::~DhtChat()
 
 void DhtChat::republishUnackedMessages()
 {
-    LobbyData data = m_lobby.getLobbyData();
-    for (auto it = data.history.messages.rbegin(); it != data.history.messages.rend(); ++it)
-    {
-        const auto& msg = *it;
-        if (msg.direction == MessageDirection::OUT)
+    LobbyData data = m_lobby.getLobbyDataWithoutHistory();
+    std::vector<ChatMessage> unackedOutMessages;
+
+    m_lobby.withHistory([&](std::span<const ChatMessage> messages) {
+        for (auto it = messages.rbegin(); it != messages.rend(); ++it)
         {
-            if (msg.seq_num > 0 && static_cast<std::uint64_t>(msg.seq_num) <= data.peer_acked_seq_nums.through)
+            const auto& msg = *it;
+            if (msg.direction == MessageDirection::OUT)
             {
-                break; // Everything older is mathematically guaranteed to be acknowledged!
-            }
-
-            if (!data.peer_acked_seq_nums.acknowledges(msg.seq_num))
-            {
-                SPDLOG_INFO("Outbox: Republishing unacknowledged message SeqNum {}", msg.seq_num);
-                nlohmann::json msgJson = msg;
-                std::string payloadStr = msgJson.dump();
-
-                ChatPublishParams params;
-                params.encryptedPayload = payloadStr;
-                params.lobbyName = data.lobby_name;
-                params.targetSeqNum = msg.seq_num;
-                params.sequenceTargetKey = data.private_node_discussion + data.my_x25519_pub;
-                params.announcedTargetKey = data.private_node_discussion + data.announced_x25519_pub;
-                params.messageTargetKey = data.private_node_discussion + data.my_x25519_pub + std::to_string(msg.seq_num);
-
-                if (m_publisher)
+                if (msg.seq_num > 0 && static_cast<std::uint64_t>(msg.seq_num) <= data.peer_acked_seq_nums.through)
                 {
-                    m_publisher->enqueueChatMessage(params);
+                    break; // Everything older is mathematically guaranteed to be acknowledged!
+                }
+
+                if (!data.peer_acked_seq_nums.acknowledges(static_cast<std::uint64_t>(msg.seq_num)))
+                {
+                    unackedOutMessages.push_back(msg);
                 }
             }
+        }
+    });
+
+    for (const auto &msg : unackedOutMessages)
+    {
+        SPDLOG_INFO("Outbox: Republishing unacknowledged message SeqNum {}", msg.seq_num);
+        nlohmann::json msgJson = msg;
+        std::string payloadStr = msgJson.dump();
+
+        ChatPublishParams params;
+        params.encryptedPayload = payloadStr;
+        params.lobbyName = data.lobby_name;
+        params.targetSeqNum = msg.seq_num;
+        params.sequenceTargetKey = data.private_node_discussion + data.my_x25519_pub;
+        params.announcedTargetKey = data.private_node_discussion + data.announced_x25519_pub;
+        params.messageTargetKey = data.private_node_discussion + data.my_x25519_pub + std::to_string(msg.seq_num);
+
+        if (m_publisher)
+        {
+            m_publisher->enqueueChatMessage(params);
         }
     }
 }
 
 std::int64_t DhtChat::sendMessage(const std::string &message)
 {
-    LobbyData data = m_lobby.getLobbyData();
+    LobbyData data = m_lobby.getLobbyDataWithoutHistory();
 
     std::int64_t currentFakeTime = TimeUtils::computeFakeTimestamp(data.fake_timezone.offset_seconds);
     int recentMessagesCount = 0;
 
-    for (auto it = data.history.messages.rbegin(); it != data.history.messages.rend(); ++it)
-    {
-        if (it->direction == MessageDirection::OUT)
+    m_lobby.withHistory([&](std::span<const ChatMessage> messages) {
+        for (auto it = messages.rbegin(); it != messages.rend(); ++it)
         {
-            if (currentFakeTime - it->fake_timestamp <= RATE_LIMIT_WINDOW_SECONDS)
+            if (it->direction == MessageDirection::OUT)
             {
-                recentMessagesCount++;
-            }
-            else
-            {
-                break; // Since our OUT messages are chronologically ordered
+                if (currentFakeTime - it->fake_timestamp <= RATE_LIMIT_WINDOW_SECONDS)
+                {
+                    recentMessagesCount++;
+                }
+                else
+                {
+                    break; // Since our OUT messages are chronologically ordered
+                }
             }
         }
-    }
+    });
 
     if (recentMessagesCount >= RATE_LIMIT_MAX_MESSAGES)
     {
@@ -136,10 +147,15 @@ void DhtChat::dispatchPatch(const nlohmann::json &patch)
     nlohmann::json mutablePatch = patch;
     if (m_publisher && m_publisher->getDhtManager() && m_publisher->getDhtManager()->getLobbyStore())
     {
-        m_publisher->getDhtManager()->getLobbyStore()->asyncUpdateLobbyData(m_lobby.getLobbyData().lobby_name, mutablePatch);
+        m_publisher->getDhtManager()->getLobbyStore()->asyncUpdateLobbyData(m_lobby.getLobbyName(), mutablePatch);
     }
     else
     {
         m_lobby.onUpdate(mutablePatch);
     }
+}
+
+std::string DhtChat::getLobbyName() const
+{
+    return m_lobby.getLobbyName();
 }

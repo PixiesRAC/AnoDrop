@@ -1,5 +1,6 @@
 #include "GuiBuilder.h"
 
+#include <cstdlib>
 #include <ncurses.h>
 #include <spdlog/spdlog.h>
 
@@ -7,17 +8,28 @@
 #include "ChangePasswordView.h"
 #include "HandshakeView.h"
 #include "LobbiesView.h"
+#include "KillSwitch.h"
 
 namespace ui
 {
 
-GuiBuilder::GuiBuilder() : m_running(false), m_selectedOption(1), m_chatHandler(std::make_unique<DhtChatHandler>())
+static void onQuickExitResetTerminal()
+{
+    if (!isendwin())
+    {
+        endwin();
+    }
+}
+
+GuiBuilder::GuiBuilder() : m_running(false), m_selectedOption(1)
 {
     initscr();
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
     curs_set(0);
+
+    std::at_quick_exit(onQuickExitResetTerminal);
 
     if (has_colors())
     {
@@ -31,23 +43,33 @@ GuiBuilder::GuiBuilder() : m_running(false), m_selectedOption(1), m_chatHandler(
     }
 }
 
+void GuiBuilder::shutdown()
+{
+    resetTerminal();
+    if (m_appFacade)
+    {
+        m_appFacade->shutdown();
+        m_appFacade.reset();
+    }
+}
+
 GuiBuilder::~GuiBuilder()
 {
-    SPDLOG_INFO("~GuiBuilder: closing ncurses...");
-    endwin();
+    SPDLOG_INFO("~GuiBuilder: closing ncurses and shutting down...");
+    shutdown();
+}
+
+void GuiBuilder::resetTerminal()
+{
+    if (!isendwin())
+    {
+        endwin();
+    }
 }
 
 void GuiBuilder::setAppFacade(std::shared_ptr<AppFacade> appFacade)
 {
     m_appFacade = std::move(appFacade);
-    if (m_appFacade)
-    {
-        m_dhtPublisher = m_appFacade->getDhtPublisher();
-        if (m_chatHandler)
-            m_chatHandler->setDhtPublisher(m_dhtPublisher);
-        
-        m_lobbyStore = m_appFacade->getLobbyStore();
-    }
 }
 
 void GuiBuilder::showLoadingScreen()
@@ -102,13 +124,19 @@ void GuiBuilder::buildAndRun()
     m_running = true;
     while (m_running)
     {
+        if (KillSwitch::getInstance().isTriggered())
+        {
+            m_running = false;
+            break;
+        }
+
         showMainMenu();
         int choice = getch();
         if (choice == KEY_UP && m_selectedOption > 1)
             m_selectedOption--;
         else if (choice == KEY_DOWN && m_selectedOption < 5)
             m_selectedOption++;
-        else if (choice == 10)
+        else if (choice == 10 || choice == 13 || choice == KEY_ENTER)
         { // ENTER
             if (m_selectedOption == 5)
             {
@@ -123,19 +151,26 @@ void GuiBuilder::buildAndRun()
                 view = std::make_unique<HandshakeView>(m_appFacade);
                 break;
             case 2:
-                view = std::make_unique<LobbiesView>(m_appFacade, m_chatHandler.get());
+                view = std::make_unique<LobbiesView>(m_appFacade);
                 break;
             case 3:
                 view = std::make_unique<ChangePasswordView>(m_appFacade);
                 break;
             case 4:
-                view = std::make_unique<AnomalyFlagView>(m_appFacade, m_lobbyStore);
+                view = std::make_unique<AnomalyFlagView>(m_appFacade);
                 break;
             }
 
             if (view)
             {
-                view->show();
+                try
+                {
+                    view->show();
+                }
+                catch (const std::exception &e)
+                {
+                    SPDLOG_ERROR("Exception caught in view {}: {}", m_selectedOption, e.what());
+                }
             }
         }
         else if (choice == 'q' || choice == 'Q')

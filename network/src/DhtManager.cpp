@@ -1,18 +1,25 @@
-#include <nlohmann/json.hpp>
-#include "LobbyDataSerializer.h"
 #include "DhtManager.h"
 
+#include <cstdlib>
+#include <iostream>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/hasher.hpp>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include "CryptoUtils.h"
 #include "HandshakeKeyService.h"
 #include "Hasher.h"
-#include "CryptoUtils.h"
+#include "KillSwitch.h"
+#include "LobbyDataSerializer.h"
+#include "NetworkUtils.h"
 
-DhtManager::DhtManager() : AlertObserver()
+DhtManager::DhtManager(const std::string &networkInterface) : AlertObserver()
 {
-    SPDLOG_INFO("Initializing DhtManager session");
+    SPDLOG_INFO("Initializing DhtManager session with network_interface='{}'", networkInterface);
+
+    KillSwitch::getInstance().init(networkInterface);
+
     lt::settings_pack p;
     p.set_bool(lt::settings_pack::enable_dht, true);
     p.set_bool(lt::settings_pack::enable_upnp, false);
@@ -21,17 +28,65 @@ DhtManager::DhtManager() : AlertObserver()
     p.set_int(lt::settings_pack::alert_mask, lt::alert_category::all);
     p.set_int(lt::settings_pack::alert_queue_size, 100000); // Prevent dropped alerts under load
 
+    if (KillSwitch::getInstance().isEnabled())
+    {
+        const std::string &boundIface = KillSwitch::getInstance().getBoundInterface();
+        SPDLOG_INFO("🔒 KILLSWITCH ACTIVE: Binding Libtorrent exclusively to interface '{}'", boundIface);
+        p.set_str(lt::settings_pack::listen_interfaces, boundIface + ":0");
+        p.set_str(lt::settings_pack::outgoing_interfaces, boundIface);
+    }
+
     m_session = std::make_shared<lt::session>(p);
 }
 
 DhtManager::~DhtManager()
 {
     SPDLOG_INFO("~DhtManager: destroying DHT session...");
+    if (m_aliveToken)
+    {
+        m_aliveToken->store(false, std::memory_order_release);
+    }
+    shutdown();
+}
+
+void DhtManager::shutdown()
+{
+    if (m_aliveToken)
+    {
+        m_aliveToken->store(false, std::memory_order_release);
+    }
+
+    if (m_session)
+    {
+        m_session->post_dht_stats();
+    }
     if (m_alertThread.joinable())
     {
+        SPDLOG_INFO("DhtManager::shutdown: stopping alert thread...");
         m_alertThread.request_stop();
         m_alertThread.join();
+        SPDLOG_INFO("DhtManager::shutdown: alert thread stopped.");
     }
+    {
+        std::lock_guard<std::mutex> lock(m_callbacksMutex);
+        m_onPutFailure = nullptr;
+        m_onNetworkRecovered = nullptr;
+    }
+    if (m_alertListener)
+    {
+        SPDLOG_INFO("DhtManager::shutdown: resetting alert listener...");
+        m_alertListener->removeObserver(this);
+        m_alertListener.reset();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(m_registryMutex);
+        m_fetchCallbacks.clear();
+    }
+    {
+        std::unique_lock<std::shared_mutex> lock(m_pendingPutsMutex);
+        m_pendingPuts.clear();
+    }
+    SPDLOG_INFO("DhtManager::shutdown: DHT shutdown completed.");
 }
 
 void DhtManager::setLobbyStore(std::shared_ptr<LobbyStore> lobbyStore)
@@ -73,29 +128,89 @@ void DhtManager::handleDhtStatsAlert(const lt::dht_stats_alert *stats)
         total_nodes += bucket.num_nodes;
     }
     SPDLOG_INFO("DHT stats received ({}). Known nodes: {}", is_v6 ? "IPv6" : "IPv4", total_nodes);
+    if (!is_v6 && total_nodes == 0 && m_isDhtReady.load(std::memory_order_acquire))
+    {
+        SPDLOG_WARN("DHT known nodes dropped to 0! Triggering network auto-recovery...");
+        recoverNetwork();
+    }
+    else if (!is_v6 && total_nodes > 0 && m_networkRecoveryPending.exchange(false, std::memory_order_acq_rel))
+    {
+        SPDLOG_INFO("🎉 Network sockets successfully recovered with {} DHT nodes!", total_nodes);
+        NetworkRecoveredCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_callbacksMutex);
+            cb = m_onNetworkRecovered;
+        }
+        if (cb)
+        {
+            cb();
+        }
+    }
     m_isDhtReady.store(true, std::memory_order_release);
     m_isDhtReady.notify_one();
 }
 
+void DhtManager::recoverNetwork()
+{
+    if (!m_session)
+        return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (m_lastRecoveryTime.time_since_epoch().count() > 0 &&
+        std::chrono::duration_cast<std::chrono::seconds>(now - m_lastRecoveryTime).count() < 10)
+    {
+        return; // Rate limit recovery to once every 10 seconds
+    }
+    m_lastRecoveryTime = now;
+    m_networkRecoveryPending.store(true, std::memory_order_release);
+
+    SPDLOG_WARN("🔄 Auto-recovery triggered: Reopening network sockets and re-bootstrapping DHT...");
+    m_session->reopen_network_sockets();
+    m_session->add_dht_node({"router.bittorrent.com", 6881});
+    m_session->add_dht_node({"dht.transmissionbt.com", 6881});
+    m_session->add_dht_node({"router.utorrent.com", 6881});
+    m_session->post_dht_stats();
+}
+
+void DhtManager::setPutFailureCallback(PutFailureCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbacksMutex);
+    m_onPutFailure = std::move(cb);
+}
+
+void DhtManager::setNetworkRecoveredCallback(NetworkRecoveredCallback cb)
+{
+    std::lock_guard<std::mutex> lock(m_callbacksMutex);
+    m_onNetworkRecovered = std::move(cb);
+}
+
+std::string DhtManager::operationKey(const std::array<char, 32> &key, const std::string &salt)
+{
+    return Util::toHex(std::string(key.data(), key.size())) + ":" + salt;
+}
+
 void DhtManager::handleMutableItemAlert(const lt::dht_mutable_item_alert *get_mut)
 {
-    std::string pubKeyHex = Util::toHex(std::string(get_mut->key.data(), get_mut->key.size()));
+    std::string opKey = operationKey(get_mut->key, get_mut->salt);
 
     DhtItemCallback callback;
     {
         std::unique_lock<std::shared_mutex> lock(m_registryMutex);
 
-        auto it = m_fetchCallbacks.find(pubKeyHex);
+        auto it = m_fetchCallbacks.find(opKey);
         if (it != m_fetchCallbacks.end())
         {
             callback = it->second.callback;
 
-            // Remove from registry immediately to prevent duplicate message processing
-            // (Libtorrent can trigger multiple alerts for the same DHT fetch).
-            // We ONLY do this for actual chat payload items (seqNumTarget != -1).
-            // For mutable polling items (Heartbeat, Ack, Anomaly), we MUST keep the callback
-            // active to process all responses and guarantee we receive the freshest value.
-            if (!it->second.isSeqNum && it->second.seqNumTarget != -1)
+            bool isChatPayload = (!it->second.isSeqNum && it->second.seqNumTarget != -1);
+            bool hasValidItem = (get_mut->item.type() != lt::entry::undefined_t);
+
+            // Cleanup logic:
+            // 1) If this is an authoritative alert (final result of DHT lookup),
+            //    we MUST erase the callback to avoid memory leaks.
+            // 2) If this is a chat payload and we received a defined, non-empty item,
+            //    we got the message and can erase it immediately to avoid duplicate processing.
+            if (get_mut->authoritative || (isChatPayload && hasValidItem))
             {
                 m_fetchCallbacks.erase(it);
             }
@@ -149,11 +264,24 @@ void DhtManager::onAlert(lt::alert *alert)
                 else
                 {
                     SPDLOG_ERROR("DHT put failed (0 nodes accepted it) for seq: {}", seqNum);
+                    recoverNetwork();
+                    PutFailureCallback putFailureCb;
+                    {
+                        std::lock_guard<std::mutex> cbLock(m_callbacksMutex);
+                        putFailureCb = m_onPutFailure;
+                    }
+                    if (putFailureCb)
+                    {
+                        putFailureCb(lobbyName, seqNum);
+                    }
                 }
             }
         }
-        lock.unlock(); // Unlock before notify to avoid immediately blocking the awakened thread
-        m_putConfirmedCv.notify_all();
+        else if (put_alert->num_success == 0)
+        {
+            SPDLOG_WARN("DHT put failed (0 nodes accepted it) for target: {}. Triggering network recovery...", targetHex);
+            recoverNetwork();
+        }
     }
     else if (auto *get_mut = lt::alert_cast<lt::dht_mutable_item_alert>(alert))
     {
@@ -163,6 +291,19 @@ void DhtManager::onAlert(lt::alert *alert)
     {
         SPDLOG_INFO("DHT bootstrap complete! The engine is connected to the network.");
         m_session->post_dht_stats();
+        if (m_networkRecoveryPending.exchange(false, std::memory_order_acq_rel))
+        {
+            SPDLOG_INFO("🎉 Network sockets successfully recovered via DHT bootstrap!");
+            NetworkRecoveredCallback networkRecoveredCb;
+            {
+                std::lock_guard<std::mutex> lock(m_callbacksMutex);
+                networkRecoveredCb = m_onNetworkRecovered;
+            }
+            if (networkRecoveredCb)
+            {
+                networkRecoveredCb();
+            }
+        }
     }
     else if (auto *listen_ok = lt::alert_cast<lt::listen_succeeded_alert>(alert))
     {
@@ -171,10 +312,24 @@ void DhtManager::onAlert(lt::alert *alert)
     else if (auto *listen_err = lt::alert_cast<lt::listen_failed_alert>(alert))
     {
         SPDLOG_ERROR("Failed to open network port: {}", listen_err->error.message());
+        KillSwitch::getInstance().handleListenFailed(listen_err->error.message());
     }
     else if (auto *dht_err = lt::alert_cast<lt::dht_error_alert>(alert))
     {
         SPDLOG_WARN("Internal DHT error: {}", dht_err->error.message());
+        recoverNetwork();
+    }
+}
+
+void DhtManager::onTick()
+{
+    KillSwitch::getInstance().checkHealth();
+
+    auto now = std::chrono::steady_clock::now();
+    if (m_session && std::chrono::duration_cast<std::chrono::seconds>(now - m_lastStatsTime).count() >= 5)
+    {
+        m_lastStatsTime = now;
+        m_session->post_dht_stats();
     }
 }
 
@@ -182,34 +337,6 @@ void DhtManager::waitUntilDhtIsReady()
 {
     SPDLOG_INFO("waiting for DHT to be ready");
     m_isDhtReady.wait(false, std::memory_order_acquire);
-}
-
-
-
-bool DhtManager::waitForPutHandshakeConfirmed(const std::string &lobbyName, int timeoutSeconds)
-{
-    std::shared_lock<std::shared_mutex> lock(m_pendingPutsMutex);
-    
-    auto hasPendingForLobby = [this, lobbyName]() {
-        for (const auto& pair : m_pendingPuts) {
-            if (lobbyName.empty() || pair.second.first == lobbyName) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    SPDLOG_INFO("waiting for put handshake confirmed for {}", lobbyName.empty() ? "all" : lobbyName);
-    
-    bool success = m_putConfirmedCv.wait_for(lock, std::chrono::seconds(timeoutSeconds), [&]() {
-        return !hasPendingForLobby();
-    });
-
-    if (!success)
-    {
-        SPDLOG_WARN("waitForPutHandshakeConfirmed timed out for {} after {} seconds", lobbyName.empty() ? "unknown" : lobbyName, timeoutSeconds);
-    }
-    return success;
 }
 
 void DhtManager::registerPendingPut(const std::string &targetHex, const std::string &lobbyName, std::int64_t seqNum)
@@ -225,7 +352,6 @@ bool DhtManager::isSessionReady() const
     return true;
 }
 
-
 static std::string getLobbySalt(const std::string &lobbyName)
 {
     auto argon2Bytes = Hasher::getInstance().generateArgon2Salt(lobbyName);
@@ -238,16 +364,27 @@ bool DhtManager::fetchDhtItem(const std::string &rawKeyString, const std::string
         return false;
 
     std::vector<unsigned char> seed = CryptoUtils::deriveHKDF(std::vector<unsigned char>(rawKeyString.begin(), rawKeyString.end()), {}, "DHTSeed", 32).value_or(std::vector<unsigned char>());
-    if (seed.empty()) { SPDLOG_ERROR("Failed to derive seed"); return false; }
+    if (seed.empty())
+    {
+        SPDLOG_ERROR("Failed to derive seed");
+        return false;
+    }
     HandshakeKeyService::ChannelKeys info(seed);
 
     std::string salt = getLobbySalt(lobbyName);
-
+    std::string opKey = operationKey(info.publicKey, salt);
     std::string pubKeyHex = Util::toHex(std::string(info.publicKey.data(), info.publicKey.size()));
 
+    auto now = std::chrono::steady_clock::now();
     {
         std::unique_lock<std::shared_mutex> lock(m_registryMutex);
-        m_fetchCallbacks[pubKeyHex] = FetchContext{callback, isSeqNum, seqNumTarget};
+
+        // Prune expired callbacks (> 60s) to prevent memory leaks if alerts were lost
+        std::erase_if(m_fetchCallbacks, [now](const auto &item) {
+            return std::chrono::duration_cast<std::chrono::seconds>(now - item.second.createdAt).count() > 60;
+        });
+
+        m_fetchCallbacks[opKey] = FetchContext{callback, isSeqNum, seqNumTarget, now};
     }
     lt::hasher h(info.publicKey.data(), info.publicKey.size());
     if (!salt.empty())

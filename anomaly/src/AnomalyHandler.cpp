@@ -6,6 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include "HandshakePayloadCodec.h"
+#include "DhtSignalingService.h"
 
 AnomalyHandler::AnomalyHandler(std::shared_ptr<DhtPublisher> dhtPublisher)
     : m_dhtPublisher(std::move(dhtPublisher))
@@ -21,7 +22,7 @@ void AnomalyHandler::dispatchAnomalyMessage(const std::string &lobbyName, const 
 
     auto publisher = m_dhtPublisher;
     publisher->enqueueNetworkTask(lobbyName, [publisher, lobbyName, message]()
-                                  { publisher->dropAnomalyMessage(message, lobbyName); });
+                                  { DhtSignalingService::dropAnomalyMessage(publisher.get(), message, lobbyName); });
 }
 
 void AnomalyHandler::checkLobbyAnomaly(const std::string &lobbyName, std::shared_ptr<LobbyStore> lobbyStore)
@@ -34,30 +35,27 @@ void AnomalyHandler::checkLobbyAnomaly(const std::string &lobbyName, std::shared
     std::weak_ptr<DhtPublisher> weakPublisher = m_dhtPublisher;
     auto callback = [lobbyName, lobbyStore, weakPublisher](const lt::dht_mutable_item_alert *get_mut)
     {
-        if (get_mut->seq == INT64_MAX)
+        std::string valueStr;
+        if (get_mut->item.type() == lt::entry::string_t)
+            valueStr = get_mut->item.string();
+        else
+            valueStr = get_mut->item.to_string();
+
+        if (auto pub = weakPublisher.lock())
         {
-            std::string valueStr;
-            if (get_mut->item.type() == lt::entry::string_t)
-                valueStr = get_mut->item.string();
-            else
-                valueStr = get_mut->item.to_string();
+            pub->enqueueNetworkTask(lobbyName, [lobbyName, lobbyStore, valueStr]()
+                                    {
+                auto existingDecryptedPayload = HandshakePayloadCodec::decryptDhtHandShakePayload(valueStr, lobbyName);
+                if (existingDecryptedPayload && existingDecryptedPayload->contains(ANOMALY_KEY) && (*existingDecryptedPayload)[ANOMALY_KEY] == true)
+                {
+                    std::string anomalyMsg = (*existingDecryptedPayload).value(MESSAGE_KEY, "Unknown anomaly");
+                    SPDLOG_WARN("Anomaly detected for lobby {}: {}", lobbyName, anomalyMsg);
 
-            if (auto pub = weakPublisher.lock())
-            {
-                pub->enqueueNetworkTask(lobbyName, [lobbyName, lobbyStore, valueStr]()
-                                        {
-                    auto existingDecryptedPayload = HandshakePayloadCodec::decryptDhtHandShakePayload(valueStr, lobbyName);
-                    if (existingDecryptedPayload && existingDecryptedPayload->contains(ANOMALY_KEY) && (*existingDecryptedPayload)[ANOMALY_KEY] == true)
-                    {
-                        std::string anomalyMsg = (*existingDecryptedPayload).value(MESSAGE_KEY, "Unknown anomaly");
-                        SPDLOG_WARN("Anomaly detected for lobby {}: {}", lobbyName, anomalyMsg);
-
-                        nlohmann::json patch;
-                        patch["status"] = LobbyStatus::ANOMALY;
-                        patch["anomaly_message"] = anomalyMsg;
-                        lobbyStore->asyncUpdateLobbyData(lobbyName, patch);
-                    } });
-            }
+                    nlohmann::json patch;
+                    patch["status"] = LobbyStatus::ANOMALY;
+                    patch["anomaly_message"] = anomalyMsg;
+                    lobbyStore->asyncUpdateLobbyData(lobbyName, patch);
+                } });
         }
     };
 

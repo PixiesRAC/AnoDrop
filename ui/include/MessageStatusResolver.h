@@ -22,7 +22,7 @@ class MessageStatusResolver
                                 std::map<std::int64_t, std::vector<std::int64_t>> &origToResyncs,
                                 std::map<std::int64_t, std::int64_t> &resyncToOrig);
 
-    static std::pair<std::string, int> resolveStatus(const ChatMessage &msg,
+    [[nodiscard]] static std::pair<std::string, int> resolveStatus(const ChatMessage &msg,
                                                      const LobbyData &lobbyData,
                                                      const std::map<std::int64_t, std::vector<std::int64_t>> &origToResyncs,
                                                      const std::map<std::int64_t, std::int64_t> &resyncToOrig);

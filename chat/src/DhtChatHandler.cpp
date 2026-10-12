@@ -26,6 +26,20 @@ DhtChat *DhtChatHandler::getChat(size_t index)
     return nullptr;
 }
 
+DhtChat *DhtChatHandler::getChatForLobby(Lobby &lobby)
+{
+    for (auto &chat : dht_chats)
+    {
+        if (chat && chat->getLobbyName() == lobby.getLobbyName())
+        {
+            return chat.get();
+        }
+    }
+    dht_chats.push_back(std::make_unique<DhtChat>(lobby, m_dhtPublisher));
+    return dht_chats.back().get();
+}
+
+
 size_t DhtChatHandler::getChatCount() const
 {
     return dht_chats.size();

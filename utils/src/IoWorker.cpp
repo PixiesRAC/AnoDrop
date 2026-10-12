@@ -36,7 +36,7 @@ void IoWorker::enqueue(std::function<void()> task)
     m_queueCv.notify_one();
 }
 
-void IoWorker::workerLoop()
+void IoWorker::workerLoop(std::stop_token stoken)
 {
     std::thread::id threadId = std::this_thread::get_id();
     int coreId = sched_getcpu();
@@ -48,10 +48,10 @@ void IoWorker::workerLoop()
         std::function<void()> task;
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
-            m_queueCv.wait(lock, [this]()
-                           { return !m_taskQueue.empty() || m_stopRequested || m_worker.get_stop_token().stop_requested(); });
+            m_queueCv.wait(lock, [this, &stoken]()
+                           { return !m_taskQueue.empty() || m_stopRequested || stoken.stop_requested(); });
 
-            if ((m_stopRequested || m_worker.get_stop_token().stop_requested()) && m_taskQueue.empty())
+            if ((m_stopRequested || stoken.stop_requested()) && m_taskQueue.empty())
             {
                 break;
             }
@@ -68,7 +68,18 @@ void IoWorker::workerLoop()
             int currentCore = sched_getcpu();
             SPDLOG_DEBUG("IoWorker executing task on Thread ID: {}, Core: {}",
                          std::hash<std::thread::id>{}(std::this_thread::get_id()), currentCore);
-            task();
+            try
+            {
+                task();
+            }
+            catch (const std::exception &e)
+            {
+                SPDLOG_ERROR("IoWorker: Unhandled exception in task: {}", e.what());
+            }
+            catch (...)
+            {
+                SPDLOG_ERROR("IoWorker: Unknown exception in task");
+            }
         }
     }
 }

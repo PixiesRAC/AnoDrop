@@ -14,8 +14,9 @@ class DhtChatHandler
     void setDhtPublisher(std::shared_ptr<DhtPublisher> pub);
 
     void addChat(Lobby &lobby);
-    DhtChat *getChat(size_t index);
-    size_t getChatCount() const;
+    [[nodiscard]] DhtChat *getChat(size_t index);
+    [[nodiscard]] DhtChat *getChatForLobby(Lobby &lobby);
+    [[nodiscard]] size_t getChatCount() const;
     void clearChats();
 
   private:

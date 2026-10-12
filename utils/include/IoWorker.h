@@ -22,5 +22,5 @@ class IoWorker
     bool m_stopRequested = false;
     std::jthread m_worker;
 
-    void workerLoop();
+    void workerLoop(std::stop_token stoken);
 };

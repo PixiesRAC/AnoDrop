@@ -13,7 +13,7 @@
 std::optional<std::vector<unsigned char>> HandshakeStateEngine::prepareLobbyPayload(std::shared_ptr<LobbyStore> lobbyStore, const std::string &lobbyName, const std::string &pseudo)
 {
     auto observer = lobbyStore->getOrCreateLobby(lobbyName);
-    LobbyData lobbyData = observer->getLobbyData(); // If no X25519 key exists, generate one
+    LobbyData lobbyData = observer->getLobbyDataWithoutHistory(); // If no X25519 key exists, generate one
 
     nlohmann::json patch;
     if (lobbyData.my_x25519_pub.empty() || lobbyData.my_x25519_priv.empty())
@@ -66,7 +66,7 @@ nlohmann::json HandshakeStateEngine::resolvePayload(const nlohmann::json &rawPay
     auto observer = lobbyStore->getLobby(lobbyName);
     if (!observer)
         return mapped;
-    LobbyData currentLobby = observer->getLobbyData();
+    LobbyData currentLobby = observer->getLobbyDataWithoutHistory();
 
     if (currentLobby.status == LobbyStatus::HANDSHAKE_DONE)
     {
@@ -192,3 +192,101 @@ nlohmann::json HandshakeStateEngine::generateFakePeersArray()
     }
     return fakeArray;
 }
+
+HandshakeTransitionResult HandshakeStateEngine::processHandshakeTransition(
+    const std::string &ourEncryptedPayload,
+    const std::string &lobbyName,
+    std::shared_ptr<LobbyStore> lobbyStore,
+    std::int64_t currentDhtSeqNum,
+    const std::string &existingItemString,
+    bool hasExistingItem)
+{
+    auto ourDecryptedPayload = HandshakePayloadCodec::decryptDhtHandShakePayload(ourEncryptedPayload, lobbyName);
+    if (!ourDecryptedPayload || !ourDecryptedPayload->is_array() || ourDecryptedPayload->empty())
+    {
+        SPDLOG_ERROR("Dropper callback: our own payload is invalid");
+        return {false, "", 0};
+    }
+
+    auto ourPeerInfo = (*ourDecryptedPayload)[0];
+
+    bool isHandshakeDone = false;
+    std::string finalEncryptedPayload = ourEncryptedPayload;
+    std::int64_t seqNum = currentDhtSeqNum;
+
+    if (hasExistingItem && seqNum > 0)
+    {
+        if (seqNum >= INT64_MAX - 2)
+        {
+            SPDLOG_INFO("Handshake is done for both parties of lobby {}", lobbyName);
+            isHandshakeDone = true;
+        }
+        auto existingDecryptedPayload = HandshakePayloadCodec::decryptDhtHandShakePayload(existingItemString, lobbyName);
+
+        if (!existingDecryptedPayload)
+        {
+            SPDLOG_WARN("Lobby {} payload is corrupted. Set to ANOMALY.", lobbyName);
+            if (lobbyStore)
+                lobbyStore->asyncUpdateLobbyData(lobbyName, {{"status", LobbyStatus::ANOMALY}});
+            return {false, "", 0};
+        }
+        if (lobbyStore)
+        {
+            nlohmann::json resolvedPatch = resolvePayload(*existingDecryptedPayload, lobbyName, lobbyStore);
+            if (!resolvedPatch.empty())
+            {
+                // Timezone adoption logic:
+                // The person who set SEQ_MAX first (the initiator) keeps their own timezone.
+                // The late participant (who sees isHandshakeDone = true) adopts the initiator's timezone.
+                if (isHandshakeDone && resolvedPatch.contains("peer_fake_timezone"))
+                {
+                    FakeTimezone peerTz = resolvedPatch["peer_fake_timezone"].get<FakeTimezone>();
+                    resolvedPatch["fake_timezone"] = peerTz;
+                    SPDLOG_INFO("Adopting peer's fake timezone '{}' for lobby {} (they set SEQ_MAX first)", peerTz.name, lobbyName);
+                }
+
+                // Remove peer_fake_timezone from the patch — it's transient metadata, not a lobby field
+                resolvedPatch.erase("peer_fake_timezone");
+
+                lobbyStore->asyncUpdateLobbyData(lobbyName, resolvedPatch);
+
+                // A finalized DHT item must retain its signed sequence even when
+                // this callback has only just completed the local handshake.
+                if (!isHandshakeDone && resolvedPatch.contains("status") && resolvedPatch["status"].get<int>() == static_cast<int>(LobbyStatus::HANDSHAKE_DONE))
+                {
+                    SPDLOG_INFO("Handshake complete for lobby {}. Setting seqNum to "
+                                "INT64_MAX - 1",
+                                lobbyName);
+                    seqNum = INT64_MAX - 2;
+                }
+            }
+        }
+
+        if (isHandshakeDone)
+        {
+            SPDLOG_INFO("Handshake is already done for lobby {}. Preserving existing DHT item.", lobbyName);
+            return {false, "", 0};
+        }
+
+        auto mergeRes = mergeHandshakePayloads(*existingDecryptedPayload, ourPeerInfo, lobbyName);
+        if (mergeRes)
+        {
+            finalEncryptedPayload = std::string(mergeRes->begin(), mergeRes->end());
+        }
+    }
+
+    auto decryptedForLog = HandshakePayloadCodec::decryptDhtHandShakePayload(finalEncryptedPayload, lobbyName);
+    if (decryptedForLog)
+    {
+        SPDLOG_INFO("Sent DHT Handshake payload (decrypted): {} for lobby {}", decryptedForLog->dump(), lobbyName);
+    }
+
+    if (finalEncryptedPayload.size() > 1000)
+    {
+        SPDLOG_ERROR("Merged payload for lobby {} exceeds 1000 bytes ({}). Aborting.", lobbyName, finalEncryptedPayload.size());
+        return {false, "", 0};
+    }
+
+    return {true, finalEncryptedPayload, seqNum + 1};
+}
+

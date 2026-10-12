@@ -4,6 +4,7 @@
 #include <libtorrent/kademlia/ed25519.hpp>
 #include <spdlog/spdlog.h>
 
+#include <openssl/crypto.h>
 #include "CryptoUtils.h"
 #include "Util.h"
 
@@ -33,6 +34,7 @@ HandshakeKeyService::ChannelKeys::ChannelKeys(const std::vector<unsigned char> &
     }
     lt::sha1_hash targetID = h.final();
     targetIDHex = Util::toHex(targetID.to_string());
+    OPENSSL_cleanse(lt_seed.data(), lt_seed.size());
 }
 
 std::expected<std::string, std::string> HandshakeKeyService::deriveSharedSecret(const std::string &myPrivHex, const std::string &peerPubHex, const std::string &lobbyName)
@@ -44,14 +46,17 @@ std::expected<std::string, std::string> HandshakeKeyService::deriveSharedSecret(
             std::vector<unsigned char> myPrivRaw = Util::fromHex(myPrivHex);
             std::vector<unsigned char> peerPubRaw = Util::fromHex(peerPubHex);
             auto sharedSecretRes = CryptoUtils::deriveX25519SharedSecret(myPrivRaw, peerPubRaw);
+            OPENSSL_cleanse(myPrivRaw.data(), myPrivRaw.size());
+            OPENSSL_cleanse(peerPubRaw.data(), peerPubRaw.size());
             if (!sharedSecretRes)
             {
                 SPDLOG_WARN("Failed to derive X25519 shared secret for lobby {}: {}", lobbyName, sharedSecretRes.error());
                 return std::unexpected(sharedSecretRes.error());
             }
-            std::vector<unsigned char> sharedSecret = *sharedSecretRes;
+            std::vector<unsigned char> sharedSecret = std::move(*sharedSecretRes);
             std::string hexSecret = Util::toHex(sharedSecret);
-            SPDLOG_INFO("Successfully derived X25519 shared secret for lobby {}. Secret: {}", lobbyName, hexSecret);
+            OPENSSL_cleanse(sharedSecret.data(), sharedSecret.size());
+            SPDLOG_INFO("Successfully derived X25519 shared secret for lobby {}", lobbyName);
             return hexSecret;
         }
         else

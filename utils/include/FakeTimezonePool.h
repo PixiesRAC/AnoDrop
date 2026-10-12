@@ -51,7 +51,7 @@ inline const std::vector<FakeTimezone> POOL = {
     {"Zelda/Chateau_Hyrule (UTC-6)", -21600},
 };
 
-inline FakeTimezone pickRandom()
+[[nodiscard]] inline FakeTimezone pickRandom()
 {
     static thread_local std::mt19937 gen(std::random_device{}());
     std::uniform_int_distribution<size_t> dist(0, POOL.size() - 1);

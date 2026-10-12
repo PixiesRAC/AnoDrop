@@ -35,6 +35,8 @@ find_package(nlohmann_json REQUIRED)
 add_executable(AnoDrop
     main.cpp
     network/src/DhtPublisher.cpp
+    network/src/NetworkResyncHandler.cpp
+    network/src/DhtSignalingService.cpp
     anomaly/src/AnomalyHandler.cpp
     heartbeat/src/HeartBeatHandler.cpp
     ack/src/AckHandler.cpp
@@ -48,10 +50,12 @@ add_executable(AnoDrop
     network/src/Dropper.cpp
     ui/src/GuiBuilder.cpp
     network/src/DhtManager.cpp
+    network/src/KillSwitch.cpp
     utils/src/Logger.cpp
     utils/src/IoWorker.cpp
     utils/src/PartitionedThreadPool.cpp
     utils/src/TimeUtils.cpp
+    utils/src/NetworkUtils.cpp
     network/src/AlertListener.cpp
     ui/src/Unlock.cpp
     crypto/src/HandshakeKeyService.cpp
@@ -61,6 +65,7 @@ add_executable(AnoDrop
     ui/src/ChangePasswordView.cpp
     ui/src/LobbiesView.cpp
     ui/src/ChatView.cpp
+    ui/src/ChatViewModel.cpp
     ui/src/MessageStatusResolver.cpp
     ui/src/AnomalyFlagView.cpp
     core/src/AppFacade.cpp
@@ -81,3 +86,8 @@ target_link_libraries(AnoDrop
 )
 
 target_include_directories(AnoDrop PRIVATE ${CURSES_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/anomaly/include ${CMAKE_CURRENT_SOURCE_DIR}/ack/include ${CMAKE_CURRENT_SOURCE_DIR}/chat/include ${CMAKE_CURRENT_SOURCE_DIR}/core/include ${CMAKE_CURRENT_SOURCE_DIR}/crypto/include ${CMAKE_CURRENT_SOURCE_DIR}/heartbeat/include ${CMAKE_CURRENT_SOURCE_DIR}/lobby/include ${CMAKE_CURRENT_SOURCE_DIR}/network/include ${CMAKE_CURRENT_SOURCE_DIR}/storage/include ${CMAKE_CURRENT_SOURCE_DIR}/ui/include ${CMAKE_CURRENT_SOURCE_DIR}/utils/include)
+
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(tests/regression)
+endif()

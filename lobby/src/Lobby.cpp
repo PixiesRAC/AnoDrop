@@ -36,7 +36,6 @@ void Lobby::onUpdate(nlohmann::json &jsonPatch)
             }
             if (!isDuplicate)
             {
-                messages.push_back(std::move(msg));
                 m_hasUpdate.store(true, std::memory_order_release);
             }
             else
@@ -67,6 +66,18 @@ void Lobby::onUpdate(nlohmann::json &jsonPatch)
 
                 // Compress the AckState window
                 m_lobbyData.downloaded_seq_nums.compress();
+            }
+            else if (msg.direction == MessageDirection::OUT)
+            {
+                if (msg.seq_num > m_lobbyData.my_seq_num)
+                {
+                    m_lobbyData.my_seq_num = msg.seq_num;
+                }
+            }
+
+            if (!isDuplicate)
+            {
+                messages.push_back(std::move(msg));
             }
         }
         catch (const std::exception &e)
@@ -112,8 +123,6 @@ void Lobby::onUpdate(nlohmann::json &jsonPatch)
         cleanPatch.erase("add_pending_resyncs");
     }
 
-
-
     if (cleanPatch.contains("message_resynced"))
     {
         std::vector<std::int64_t> seqs = cleanPatch["message_resynced"].get<std::vector<std::int64_t>>();
@@ -132,32 +141,94 @@ void Lobby::onUpdate(nlohmann::json &jsonPatch)
     if (cleanPatch.empty())
         return;
 
-    auto saved_history = m_lobbyData.history; // Preserve history shared_ptr
-    nlohmann::json j = m_lobbyData;
-    j.erase("history"); // Prevent deep copy serialization of history
-
-    nlohmann::json nestedPatch = nlohmann::json::object();
-    for (auto it = cleanPatch.begin(); it != cleanPatch.end(); ++it) {
-        if (it.key() == "my_x25519_pub" || it.key() == "my_x25519_priv" || 
-            it.key() == "announced_x25519_pub" || it.key() == "private_node_discussion") {
-            nestedPatch["keys"][it.key()] = it.value();
-        } else if (it.key() == "my_seq_num" || it.key() == "dht_acked_seq_nums" || it.key() == "peer_acked_seq_nums") {
-            nestedPatch["outbound"][it.key()] = it.value();
-        } else if (it.key() == "announced_seq_num" || it.key() == "downloaded_seq_nums" || it.key() == "resynced_seq_nums") {
-            nestedPatch["inbound"][it.key()] = it.value();
-        } else {
-            nestedPatch[it.key()] = it.value();
+    bool changed = false;
+    for (auto it = cleanPatch.begin(); it != cleanPatch.end(); ++it)
+    {
+        const auto &key = it.key();
+        const auto &val = it.value();
+        try
+        {
+            if (key == "status") {
+                auto newStatus = val.is_number() ? static_cast<LobbyStatus>(val.get<int>()) : val.get<LobbyStatus>();
+                if (m_lobbyData.status != newStatus) { m_lobbyData.status = newStatus; changed = true; }
+            }
+            else if (key == "my_pseudo") {
+                auto s = val.get<std::string>();
+                if (m_lobbyData.my_pseudo != s) { m_lobbyData.my_pseudo = std::move(s); changed = true; }
+            }
+            else if (key == "other_pseudo") {
+                auto s = val.get<std::string>();
+                if (m_lobbyData.other_pseudo != s) { m_lobbyData.other_pseudo = std::move(s); changed = true; }
+            }
+            else if (key == "my_x25519_pub") {
+                auto s = val.get<std::string>();
+                if (m_lobbyData.my_x25519_pub != s) { m_lobbyData.my_x25519_pub = std::move(s); changed = true; }
+            }
+            else if (key == "my_x25519_priv") {
+                auto s = val.get<std::string>();
+                if (m_lobbyData.my_x25519_priv != s) { m_lobbyData.my_x25519_priv = std::move(s); changed = true; }
+            }
+            else if (key == "announced_x25519_pub") {
+                auto s = val.get<std::string>();
+                if (m_lobbyData.announced_x25519_pub != s) { m_lobbyData.announced_x25519_pub = std::move(s); changed = true; }
+            }
+            else if (key == "private_node_discussion") {
+                auto s = val.get<std::string>();
+                if (m_lobbyData.private_node_discussion != s) { m_lobbyData.private_node_discussion = std::move(s); changed = true; }
+            }
+            else if (key == "my_seq_num") {
+                auto n = val.get<std::int64_t>();
+                if (m_lobbyData.my_seq_num != n) { m_lobbyData.my_seq_num = n; changed = true; }
+            }
+            else if (key == "announced_seq_num") {
+                auto n = val.get<std::int64_t>();
+                if (m_lobbyData.announced_seq_num != n) { m_lobbyData.announced_seq_num = n; changed = true; }
+            }
+            else if (key == "dht_acked_seq_nums") {
+                auto a = val.get<AckState>();
+                if (m_lobbyData.dht_acked_seq_nums != a) { m_lobbyData.dht_acked_seq_nums = std::move(a); changed = true; }
+            }
+            else if (key == "peer_acked_seq_nums") {
+                auto a = val.get<AckState>();
+                if (m_lobbyData.peer_acked_seq_nums != a) { m_lobbyData.peer_acked_seq_nums = std::move(a); changed = true; }
+            }
+            else if (key == "downloaded_seq_nums") {
+                auto a = val.get<AckState>();
+                if (m_lobbyData.downloaded_seq_nums != a) { m_lobbyData.downloaded_seq_nums = std::move(a); changed = true; }
+            }
+            else if (key == "resynced_seq_nums") {
+                auto r = val.get<std::vector<std::int64_t>>();
+                if (m_lobbyData.resynced_seq_nums != r) { m_lobbyData.resynced_seq_nums = std::move(r); changed = true; }
+            }
+            else if (key == "fake_timezone") {
+                auto tz = val.get<FakeTimezone>();
+                if (m_lobbyData.fake_timezone != tz) { m_lobbyData.fake_timezone = std::move(tz); changed = true; }
+            }
+            else if (key == "read_messages_count") {
+                auto c = val.get<std::size_t>();
+                if (m_lobbyData.read_messages_count != c) { m_lobbyData.read_messages_count = c; changed = true; }
+            }
+            else if (key == "is_hidden") {
+                auto h = val.get<bool>();
+                if (m_lobbyData.is_hidden != h) { m_lobbyData.is_hidden = h; changed = true; }
+            }
+            else if (key == "anomaly_message") {
+                auto s = val.get<std::string>();
+                if (m_lobbyData.anomaly_message != s) { m_lobbyData.anomaly_message = std::move(s); changed = true; }
+            }
+            else if (key == "last_heartbeat") {
+                auto t = val.get<int64_t>();
+                if (m_lobbyData.last_heartbeat != t) { m_lobbyData.last_heartbeat = t; changed = true; }
+            }
+        }
+        catch (const std::exception &e)
+        {
+            SPDLOG_WARN("Error patching field '{}': {}", key, e.what());
         }
     }
 
-    j.merge_patch(nestedPatch);
-    LobbyData newData = j.get<LobbyData>();
-    newData.history = saved_history; // Restore history shared_ptr
-
-    // Notify UI only if data actually changed
-    if (m_lobbyData != newData)
+    if (changed)
     {
-        m_lobbyData = newData;
-        m_hasUpdate = true;
+        m_hasUpdate.store(true, std::memory_order_release);
     }
 }

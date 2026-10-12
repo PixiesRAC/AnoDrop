@@ -61,6 +61,10 @@ Config::Config(int argc, char *argv[]) : m_storePath("store"), m_logPath("anodro
                     {
                         m_pullMessagesOnStartup = configJson["pull_messages_on_startup"].get<bool>();
                     }
+                    if (configJson.contains("network_interface") && configJson["network_interface"].is_string())
+                    {
+                        m_networkInterface = configJson["network_interface"].get<std::string>();
+                    }
                 }
                 else
                 {
@@ -114,3 +118,9 @@ bool Config::getPullMessagesOnStartup() const
 {
     return m_pullMessagesOnStartup;
 }
+
+std::string Config::getNetworkInterface() const
+{
+    return m_networkInterface;
+}
+

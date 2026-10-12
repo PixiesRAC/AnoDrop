@@ -1,6 +1,6 @@
-#include <nlohmann/json.hpp>
 #pragma once
 
+#include <nlohmann/json.hpp>
 #include "Lobby.h"
 
 class DhtPublisher;
@@ -14,9 +14,10 @@ class DhtChat
     DhtChat(Lobby &lobby, std::shared_ptr<DhtPublisher> pub);
     ~DhtChat();
 
-    std::int64_t sendMessage(const std::string &message);
+    [[nodiscard]] std::int64_t sendMessage(const std::string &message);
     void republishUnackedMessages();
     void dispatchPatch(const nlohmann::json &patch);
+    [[nodiscard]] std::string getLobbyName() const;
 
   private:
     Lobby &m_lobby;

@@ -26,12 +26,16 @@ class AckHandler
 
   private:
     std::shared_ptr<DhtPublisher> m_dhtPublisher;
-    std::mutex m_ackMutex;
-
     static constexpr char ACK_KEY[5] = "_ACK";
-    std::unordered_map<std::string, std::string> m_lastPushedAckString;
-    std::unordered_map<std::string, std::string> m_lastFetchedPeerAckString;
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_lastAckPushTime;
-    std::unordered_map<std::string, AckState> m_receivedSeqsCache;
-    std::unordered_map<std::string, int64_t> m_lastContiguousSeq;
+
+    struct CacheState
+    {
+        std::mutex ackMutex;
+        std::unordered_map<std::string, std::string> lastPushedAckString;
+        std::unordered_map<std::string, std::string> lastFetchedPeerAckString;
+        std::unordered_map<std::string, std::chrono::steady_clock::time_point> lastAckPushTime;
+        std::unordered_map<std::string, AckState> receivedSeqsCache;
+        std::unordered_map<std::string, int64_t> lastContiguousSeq;
+    };
+    std::shared_ptr<CacheState> m_cache{std::make_shared<CacheState>()};
 };

@@ -7,14 +7,15 @@ class Config
   public:
     Config(int argc, char *argv[]);
 
-    std::string getStorePath() const;
-    std::string getLogPath() const;
-    int getFetchInterval() const;
-    int getArgon2Iterations() const;
-    std::string getLogLevel() const;
-    int getMaxConcurrentFetches() const;
-    std::string getExtraSaltDataForLobbyHandshake() const;
-    bool getPullMessagesOnStartup() const;
+    [[nodiscard]] std::string getStorePath() const;
+    [[nodiscard]] std::string getLogPath() const;
+    [[nodiscard]] int getFetchInterval() const;
+    [[nodiscard]] int getArgon2Iterations() const;
+    [[nodiscard]] std::string getLogLevel() const;
+    [[nodiscard]] int getMaxConcurrentFetches() const;
+    [[nodiscard]] std::string getExtraSaltDataForLobbyHandshake() const;
+    [[nodiscard]] bool getPullMessagesOnStartup() const;
+    [[nodiscard]] std::string getNetworkInterface() const;
 
   private:
     std::string m_storePath;
@@ -25,4 +26,5 @@ class Config
     int m_maxConcurrentFetches{5};
     std::string m_extraSaltDataForLobbyHandshake{"AnoDrop"};
     bool m_pullMessagesOnStartup{true};
+    std::string m_networkInterface{"any"};
 };
