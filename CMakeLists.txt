@@ -35,14 +35,16 @@ find_package(nlohmann_json REQUIRED)
 add_executable(AnoDrop
     main.cpp
     network/src/DhtPublisher.cpp
+    network/src/HandshakeCoordinator.cpp
+    network/src/OutboxPublisher.cpp
+    network/src/MessageReceiver.cpp
     network/src/NetworkResyncHandler.cpp
-    network/src/DhtSignalingService.cpp
     anomaly/src/AnomalyHandler.cpp
     heartbeat/src/HeartBeatHandler.cpp
     ack/src/AckHandler.cpp
     core/src/Config.cpp
     storage/src/LobbyStore.cpp
-    lobby/src/LobbyListener.cpp
+    lobby/src/LobbyRegistry.cpp
     lobby/src/LobbyDataSerializer.cpp
     lobby/src/Lobby.cpp
     lobby/src/LobbyFetcher.cpp
@@ -61,6 +63,7 @@ add_executable(AnoDrop
     crypto/src/HandshakeKeyService.cpp
     crypto/src/HandshakePayloadCodec.cpp
     lobby/src/HandshakeStateEngine.cpp
+  lobby/src/HandshakePreparation.cpp
     ui/src/HandshakeView.cpp
     ui/src/ChangePasswordView.cpp
     ui/src/LobbiesView.cpp
@@ -87,7 +90,24 @@ target_link_libraries(AnoDrop
 
 target_include_directories(AnoDrop PRIVATE ${CURSES_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/anomaly/include ${CMAKE_CURRENT_SOURCE_DIR}/ack/include ${CMAKE_CURRENT_SOURCE_DIR}/chat/include ${CMAKE_CURRENT_SOURCE_DIR}/core/include ${CMAKE_CURRENT_SOURCE_DIR}/crypto/include ${CMAKE_CURRENT_SOURCE_DIR}/heartbeat/include ${CMAKE_CURRENT_SOURCE_DIR}/lobby/include ${CMAKE_CURRENT_SOURCE_DIR}/network/include ${CMAKE_CURRENT_SOURCE_DIR}/storage/include ${CMAKE_CURRENT_SOURCE_DIR}/ui/include ${CMAKE_CURRENT_SOURCE_DIR}/utils/include)
 
+add_executable(decrypt_store
+    tools/decrypt_store.cpp
+    crypto/src/CryptoUtils.cpp
+)
+target_include_directories(decrypt_store PRIVATE
+    ${OPENSSL_INCLUDE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/crypto/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/utils/include
+)
+target_link_libraries(decrypt_store PRIVATE
+    OpenSSL::Crypto
+    nlohmann_json::nlohmann_json
+    argon2
+    spdlog::spdlog
+)
+
 include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests/regression)
 endif()
+

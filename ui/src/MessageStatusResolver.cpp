@@ -1,30 +1,32 @@
 #include "MessageStatusResolver.h"
 #include "ChatConstants.h"
 #include <algorithm>
+#include <charconv>
+#include <string_view>
 
 namespace ui
 {
 
-void MessageStatusResolver::buildResyncMaps(const std::vector<ChatMessage> &messages,
+void MessageStatusResolver::buildResyncMaps(std::span<const ChatMessage> messages,
                                             std::map<std::int64_t, std::vector<std::int64_t>> &origToResyncs,
                                             std::map<std::int64_t, std::int64_t> &resyncToOrig)
 {
     for (const auto &msg : messages)
     {
-        if (msg.direction == MessageDirection::OUT && msg.content.find(chat::RESYNC_PREFIX) == 0)
+        if (msg.direction == MessageDirection::OUT && msg.content.starts_with(chat::RESYNC_PREFIX))
         {
-            size_t start = chat::RESYNC_PREFIX.length();
-            size_t end = msg.content.find(" ", start);
-            if (end != std::string::npos)
+            const std::string_view contentView(msg.content);
+            const size_t start = chat::RESYNC_PREFIX.length();
+            const size_t end = contentView.find(' ', start);
+            if (end != std::string_view::npos)
             {
-                try
+                const std::string_view seqToken = contentView.substr(start, end - start);
+                std::int64_t origSeq = 0;
+                const auto [ptr, ec] = std::from_chars(seqToken.data(), seqToken.data() + seqToken.size(), origSeq);
+                if (ec == std::errc{} && ptr == seqToken.data() + seqToken.size() && origSeq > 0)
                 {
-                    std::int64_t origSeq = std::stoll(msg.content.substr(start, end - start));
                     origToResyncs[origSeq].push_back(msg.seq_num);
                     resyncToOrig[msg.seq_num] = origSeq;
-                }
-                catch (...)
-                {
                 }
             }
         }
@@ -32,7 +34,7 @@ void MessageStatusResolver::buildResyncMaps(const std::vector<ChatMessage> &mess
 }
 
 std::pair<std::string, int> MessageStatusResolver::resolveStatus(const ChatMessage &msg,
-                                                                 const LobbyData &lobbyData,
+                                                                 const LobbyViewData &lobbyData,
                                                                  const std::map<std::int64_t, std::vector<std::int64_t>> &origToResyncs,
                                                                  const std::map<std::int64_t, std::int64_t> &resyncToOrig)
 {
@@ -40,14 +42,17 @@ std::pair<std::string, int> MessageStatusResolver::resolveStatus(const ChatMessa
         return {"", 0};
 
     auto isSeqAcked = [&](std::int64_t s) {
-        return lobbyData.peer_acked_seq_nums.acknowledges(s);
+        return lobbyData.sync.peer_acked_seq_nums.acknowledges(s);
     };
 
     bool isPeerAcked = isSeqAcked(msg.seq_num);
 
-    if (!isPeerAcked && origToResyncs.count(msg.seq_num))
+    const auto origIt = origToResyncs.find(msg.seq_num);
+    const bool hasResyncChildren = (origIt != origToResyncs.end());
+
+    if (!isPeerAcked && hasResyncChildren)
     {
-        for (auto rSeq : origToResyncs.at(msg.seq_num))
+        for (auto rSeq : origIt->second)
         {
             if (isSeqAcked(rSeq))
             {
@@ -57,24 +62,27 @@ std::pair<std::string, int> MessageStatusResolver::resolveStatus(const ChatMessa
         }
     }
 
-    if (!isPeerAcked && resyncToOrig.count(msg.seq_num))
+    if (!isPeerAcked)
     {
-        if (isSeqAcked(resyncToOrig.at(msg.seq_num)))
+        if (const auto resyncIt = resyncToOrig.find(msg.seq_num); resyncIt != resyncToOrig.end())
         {
-            isPeerAcked = true;
+            if (isSeqAcked(resyncIt->second))
+            {
+                isPeerAcked = true;
+            }
         }
     }
 
-    bool isAcked = lobbyData.dht_acked_seq_nums.acknowledges(msg.seq_num);
+    bool isAcked = lobbyData.sync.dht_acked_seq_nums.acknowledges(msg.seq_num);
     bool isResynced = std::binary_search(
-        lobbyData.resynced_seq_nums.begin(), lobbyData.resynced_seq_nums.end(), msg.seq_num);
+        lobbyData.sync.resynced_seq_nums.begin(), lobbyData.sync.resynced_seq_nums.end(), msg.seq_num);
 
     bool anyResyncAcked = false;
-    if (origToResyncs.count(msg.seq_num))
+    if (hasResyncChildren)
     {
-        for (auto rSeq : origToResyncs.at(msg.seq_num))
+        for (auto rSeq : origIt->second)
         {
-            if (lobbyData.dht_acked_seq_nums.acknowledges(rSeq))
+            if (lobbyData.sync.dht_acked_seq_nums.acknowledges(rSeq))
             {
                 anyResyncAcked = true;
                 break;
@@ -84,12 +92,12 @@ std::pair<std::string, int> MessageStatusResolver::resolveStatus(const ChatMessa
 
     if (isPeerAcked)
     {
-        if (isResynced || origToResyncs.count(msg.seq_num))
+        if (isResynced || hasResyncChildren)
             return {STATUS_ACK_VIA_RESYNC, 3};
         else
             return {STATUS_ACK, 3};
     }
-    else if (isResynced || origToResyncs.count(msg.seq_num))
+    else if (isResynced || hasResyncChildren)
     {
         if (anyResyncAcked)
             return {STATUS_SENT_VIA_RESYNC, 5};

@@ -1,9 +1,10 @@
-#include <nlohmann/json.hpp>
-#include "LobbyDataSerializer.h"
+#include "LogEvents.h"
 #include "LobbyStore.h"
 
 #include <fstream>
+#include <chrono>
 #include <future>
+#include <nlohmann/json.hpp>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <spdlog/spdlog.h>
@@ -11,15 +12,34 @@
 #include "CryptoUtils.h"
 #include "Hasher.h"
 #include "Lobby.h"
+#include "LobbyDataSerializer.h"
+#include "LobbyUpdate.h"
+#include "LobbyUpdateCodec.h"
 #include "Util.h"
+
+namespace
+{
+void syncPath(const std::filesystem::path &path, bool directory = false)
+{
+    const std::filesystem::path target = path.empty() ? std::filesystem::path(".") : path;
+    const int fd = ::open(target.c_str(), O_RDONLY | O_CLOEXEC | (directory ? O_DIRECTORY : 0));
+    if (fd < 0)
+        throw std::runtime_error("Cannot open path for durable sync");
+    const int result = ::fsync(fd);
+    ::close(fd);
+    if (result != 0)
+        throw std::runtime_error("Durable sync failed");
+}
+} // namespace
 
 LobbyStore::LobbyStore(const std::string &masterPassword, const std::string &storeDir) : m_storeDir(storeDir)
 {
+    const auto started = std::chrono::steady_clock::now();
     std::error_code ec;
     std::filesystem::create_directories(m_storeDir, ec);
     std::filesystem::permissions(m_storeDir, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec);
-    std::filesystem::create_directories(std::filesystem::path(m_storeDir) / "lobbies", ec);
-    std::filesystem::permissions(std::filesystem::path(m_storeDir) / "lobbies", std::filesystem::perms::owner_all, std::filesystem::perm_options::replace, ec);
+
+    m_journal = std::make_shared<EncryptedJournal>(std::filesystem::path(m_storeDir) / "transactions.v1.enc");
 
     std::filesystem::path vaultPath = std::filesystem::path(m_storeDir) / "vault.enc";
 
@@ -44,25 +64,25 @@ LobbyStore::LobbyStore(const std::string &masterPassword, const std::string &sto
 
         if (!dekRes)
         {
+            SPDLOG_WARN("[VAULT] Unlock failed: incorrect password or corrupted vault");
             throw std::runtime_error("Wrong master password or corrupted vault");
         }
-        m_masterKey = *dekRes;
+        m_masterKey->bytes = std::move(*dekRes);
+        SPDLOG_INFO("[VAULT] Vault unlocked");
     }
     else
     {
-        if (std::filesystem::exists(std::filesystem::path(m_storeDir) / "vault_salt.bin"))
-        {
-            throw std::runtime_error("Unsupported old vault format detected. Migration is required but not supported in this version.");
-        }
+        if (std::filesystem::file_size(std::filesystem::path(m_storeDir) / "transactions.v1.enc") != 0)
+            throw std::runtime_error("Vault missing for non-empty journal");
         std::vector<unsigned char> salt(16);
-        m_masterKey.resize(32);
-        if (RAND_bytes(salt.data(), static_cast<int>(salt.size())) != 1 || RAND_bytes(m_masterKey.data(), static_cast<int>(m_masterKey.size())) != 1)
+        m_masterKey->bytes.resize(32);
+        if (RAND_bytes(salt.data(), static_cast<int>(salt.size())) != 1 || RAND_bytes(m_masterKey->bytes.data(), static_cast<int>(m_masterKey->bytes.size())) != 1)
         {
             throw std::runtime_error("RAND_bytes failed");
         }
 
         std::vector<unsigned char> kek = CryptoUtils::deriveStoreKey(masterPassword, salt);
-        auto encryptedDekRes = CryptoUtils::encryptAES256GCM(m_masterKey, kek);
+        auto encryptedDekRes = CryptoUtils::encryptAES256GCM(m_masterKey->bytes, kek);
         OPENSSL_cleanse(kek.data(), kek.size());
 
         if (!encryptedDekRes)
@@ -71,405 +91,337 @@ LobbyStore::LobbyStore(const std::string &masterPassword, const std::string &sto
         }
 
         std::vector<unsigned char> vaultData;
+        vaultData.reserve(salt.size() + encryptedDekRes->size());
         vaultData.insert(vaultData.end(), salt.begin(), salt.end());
         vaultData.insert(vaultData.end(), encryptedDekRes->begin(), encryptedDekRes->end());
 
         std::ofstream outFile(vaultPath, std::ios::binary);
-        if (!outFile || !outFile.write(reinterpret_cast<const char *>(vaultData.data()), vaultData.size()))
+        if (!outFile || !outFile.write(reinterpret_cast<const char *>(vaultData.data()), static_cast<std::streamsize>(vaultData.size())))
         {
             throw std::runtime_error("Failed to write vault.enc");
         }
         outFile.close();
+        if (outFile.fail())
+            throw std::runtime_error("Failed to close vault");
+        syncPath(vaultPath);
+        syncPath(m_storeDir, true);
+        SPDLOG_INFO("[VAULT] New vault created and synchronized");
         std::filesystem::permissions(vaultPath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, ec);
     }
 
-    m_lobbyListener = std::make_unique<LobbyListener>();
-    populateLobbies();
+    SPDLOG_INFO("[VAULT] Vault ready elapsed_ms={}", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+    std::size_t replayed = 0;
+    m_lobbyRegistry = std::make_unique<LobbyRegistry>();
+    m_journal->replay(m_masterKey->bytes, [this, &replayed](std::span<const unsigned char> bytes, EncryptedJournal::Location location)
+                      {
+        ++replayed;
+        const auto record = nlohmann::json::parse(bytes.begin(), bytes.end());
+        if (record.at("version").get<int>() != 1) throw std::runtime_error("Unsupported journal version");
+        auto update = record.at("update").get<LobbyUpdate>();
+        getOrCreateLobby(record.at("lobby").get<std::string>())->onUpdate(update, update.new_message ? journalMessageLoader(location) : MessageLoader{}); });
+    SPDLOG_INFO("[STORE] Journal replay completed transactions={} lobbies={}", replayed, m_lobbyRegistry->all().size());
 }
 
 LobbyStore::~LobbyStore()
 {
     m_ioWorker.stopAndDrain();
-    if (!m_masterKey.empty())
-    {
-        OPENSSL_cleanse(m_masterKey.data(), m_masterKey.capacity());
-    }
+    SPDLOG_INFO("[SHUTDOWN] Storage queue drained");
 }
 
-std::expected<void, StoreError> LobbyStore::saveLobbyData(const LobbyData &data)
+bool LobbyStore::execute(const std::string &lobbyName, lobby::Command command)
 {
-    std::string filename = Util::toHex(Hasher::getInstance().getHashMsg256(data.lobby_name)) + ".enc";
-    std::filesystem::path filePath = std::filesystem::path(m_storeDir) / "lobbies" / filename;
-    std::filesystem::path tmpPath = filePath.string() + ".tmp";
-
-    nlohmann::json dataToSave = data;
-    dataToSave.erase("history"); // Exclude history from the main file
-    std::string jsonStr = dataToSave.dump();
-    std::vector<unsigned char> plaintext(jsonStr.begin(), jsonStr.end());
-
-    try
-    {
-
-        std::string aadStr = "v1|" + filename;
-        std::vector<unsigned char> aad(aadStr.begin(), aadStr.end());
-
-        auto ciphertextRes = CryptoUtils::encryptAES256GCM(plaintext, m_masterKey, aad);
-        if (!ciphertextRes)
-        {
-            return std::unexpected(StoreError::EncryptionFailed);
-        }
-        std::vector<unsigned char> ciphertext = *ciphertextRes;
-
-        std::ofstream outFile(tmpPath, std::ios::binary);
-        if (!outFile)
-        {
-            SPDLOG_ERROR("saveLobbyData: Failed to open {} for writing. Errno: {} ({})", tmpPath.string(), errno, strerror(errno));
-            return std::unexpected(StoreError::FileOpenFailed);
-        }
-        if (!outFile.write(reinterpret_cast<const char *>(ciphertext.data()), ciphertext.size()))
-        {
-            return std::unexpected(StoreError::WriteFailed);
-        }
-        outFile.close(); // Important to close before renaming
-
-        std::error_code permEc;
-        std::filesystem::permissions(tmpPath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, permEc);
-
-        // Atomic rename by the OS
-        std::filesystem::rename(tmpPath, filePath);
-
-        SPDLOG_INFO("Lobby data saved successfully for {}", data.lobby_name);
-        return {};
-    }
-    catch (const std::exception &e)
-    {
-        SPDLOG_ERROR("Error saving lobby data: {}", e.what());
-        if (std::filesystem::exists(tmpPath))
-        {
-            std::filesystem::remove(tmpPath); // Cleanup in case of error
-        }
-        return std::unexpected(StoreError::Unknown);
-    }
+    return transact(lobbyName, [command = std::move(command)](const LobbyData &state)
+                    { return lobby::prepare(state, command); });
 }
 
-std::expected<void, StoreError> LobbyStore::appendHistory(const std::string &lobbyName, const std::vector<ChatMessage> &newMessages)
+bool LobbyStore::commit(const std::string &lobbyName, const LobbyUpdate &update)
 {
-    if (newMessages.empty())
-        return {};
-
-    std::string filename = Util::toHex(Hasher::getInstance().getHashMsg256(lobbyName)) + ".history.enc";
-    std::filesystem::path filePath = std::filesystem::path(m_storeDir) / "lobbies" / filename;
-
-    std::ofstream outFile(filePath, std::ios::binary | std::ios::app);
-    if (!outFile)
-    {
-        return std::unexpected(StoreError::FileOpenFailed);
-    }
-    std::error_code permEc;
-    std::filesystem::permissions(filePath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, permEc);
-
-    try
-    {
-        for (const auto &msg : newMessages)
-        {
-            nlohmann::json j = msg;
-            std::string jsonStr = j.dump();
-
-            // Obfuscate message length: pad with spaces to a multiple of 256 bytes
-            size_t blockSize = 256;
-            size_t padding = blockSize - (jsonStr.size() % blockSize);
-            if (padding != blockSize)
-            {
-                jsonStr.append(padding, ' ');
-            }
-
-            std::vector<unsigned char> plaintext(jsonStr.begin(), jsonStr.end());
-
-            std::string aadStr = "v1|" + filename + "|" + std::to_string(msg.seq_num);
-            std::vector<unsigned char> aad(aadStr.begin(), aadStr.end());
-
-            auto ciphertextRes = CryptoUtils::encryptAES256GCM(plaintext, m_masterKey, aad);
-            if (!ciphertextRes)
-            {
-                return std::unexpected(StoreError::EncryptionFailed);
-            }
-            const auto &ciphertext = *ciphertextRes;
-
-            uint32_t size = static_cast<uint32_t>(ciphertext.size());
-            uint64_t seqNum = msg.seq_num;
-            if (!outFile.write(reinterpret_cast<const char *>(&size), sizeof(size)) ||
-                !outFile.write(reinterpret_cast<const char *>(&seqNum), sizeof(seqNum)) ||
-                !outFile.write(reinterpret_cast<const char *>(ciphertext.data()), ciphertext.size()))
-            {
-                return std::unexpected(StoreError::WriteFailed);
-            }
-        }
-        return {};
-    }
-    catch (const std::exception &e)
-    {
-        return std::unexpected(StoreError::Unknown);
-    }
+    return transact(lobbyName, [update](const LobbyData &)
+                    { return update; });
 }
 
-void LobbyStore::asyncUpdateLobbyData(const std::string &lobbyName, const nlohmann::json &jsonPatch)
+bool LobbyStore::transact(const std::string &lobbyName,
+                          std::function<LobbyUpdate(const LobbyData &)> mutator)
 {
-    // Make a mutable copy of the patch so onUpdate can remove redundant data (like duplicate messages)
-    nlohmann::json mutablePatch = jsonPatch;
-    
-    // Apply patch immediately in-memory
-    auto observer = getOrCreateLobby(lobbyName);
-    observer->onUpdate(mutablePatch);
-
-    // Persist to disk asynchronously only if the patch is still meaningful
-    if (!mutablePatch.empty()) {
-        // Note: No global mutex is needed in updateLobbyData because all tasks for this
-        // ioWorker are executed sequentially on a single dedicated thread. This guarantees consistency.
-        m_ioWorker.enqueue([this, lobbyName, observer, mutablePatch]()
-                           { this->updateLobbyData(lobbyName, observer, mutablePatch); });
-    }
-}
-
-void LobbyStore::updateLobbyData(const std::string &lobbyName, std::shared_ptr<LobbyObserver> observer, const nlohmann::json &jsonPatch)
-{
-    nlohmann::json logPatch = jsonPatch;
-    if (logPatch.contains("history"))
-    {
-        logPatch["history"] = "[history updated]";
-    }
-    SPDLOG_DEBUG("updateLobbyData for lobby {}: {}", lobbyName, logPatch.dump());
-
-    bool metadataChanged = false;
-    bool hasNewMessage = false;
-    for (auto it = jsonPatch.begin(); it != jsonPatch.end(); ++it)
-    {
-        if (it.key() == "new_message")
+    return runOnIoWorker([this, lobbyName, mutator = std::move(mutator)]() -> bool
+                         {
+        auto observer = getLobby(lobbyName);
+        const bool created = !observer;
+        if (created)
         {
-            auto msg = it.value().get<ChatMessage>();
-            if (msg.direction == MessageDirection::IN)
+            LobbyData initial;
+            initial.metadata.lobby_name = lobbyName;
+            observer = std::make_shared<Lobby>(initial);
+        }
+        auto update = observer->normalizeUpdate(mutator(observer->getLobbyDataWithoutHistory()));
+        const bool changed = !update.empty();
+        if (changed)
+        {
+            nlohmann::json record{{"version", 1}, {"lobby", lobbyName}, {"update", update}};
+            SPDLOG_DEBUG("[STORE] Lobby update prepared field_count={}", record["update"].size());
+            std::string bytes = record.dump();
+            const auto writeStarted = std::chrono::steady_clock::now();
+            EncryptedJournal::Location location{};
+            try
             {
-                SPDLOG_DEBUG("📥 [RECEIVED] I/O Worker: Writing incoming message to disk: '{}'", msg.content);
+                location = m_journal->append(std::span<const unsigned char>(
+                                                 reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()),
+                                             m_masterKey->bytes);
             }
-            else
+            catch (...)
             {
-                SPDLOG_DEBUG("📤 [SENT] I/O Worker: Writing outgoing message to disk: '{}'", msg.content);
+                OPENSSL_cleanse(bytes.data(), bytes.size());
+                m_needsRecovery = true;
+                SPDLOG_CRITICAL("[STORE] Journal write failed; recovery required");
+                throw StoreRecoveryRequired();
             }
-
-            auto res = appendHistory(lobbyName, {msg});
-            if (!res)
-                SPDLOG_ERROR("Failed to append history: {}", storeErrorToString(res.error()));
-            else
-                hasNewMessage = true;
-        }
-        else
-        {
-            metadataChanged = true;
-        }
-    }
-
-    if (metadataChanged || hasNewMessage)
-    {
-        auto data = observer->getLobbyDataWithoutHistory();
-        auto res = saveLobbyData(data);
-        if (!res)
-            SPDLOG_ERROR("Failed to save lobby metadata: {}", storeErrorToString(res.error()));
-    }
-}
-
-std::expected<LobbyData, StoreError> LobbyStore::loadLobbyDataFromFile(const std::filesystem::path &filePath)
-{
-    if (!std::filesystem::exists(filePath))
-    {
-        return std::unexpected(StoreError::FileNotFound);
-    }
-
-    try
-    {
-        std::ifstream inFile(filePath, std::ios::binary | std::ios::ate);
-        if (!inFile)
-        {
-            return std::unexpected(StoreError::FileOpenFailed);
-        }
-        std::streamsize size = inFile.tellg();
-        inFile.seekg(0, std::ios::beg);
-
-        std::vector<unsigned char> ciphertextBlob(size);
-        if (!inFile.read(reinterpret_cast<char *>(ciphertextBlob.data()), size))
-        {
-            return std::unexpected(StoreError::ReadFailed);
-        }
-
-        std::vector<unsigned char> currentKey = m_masterKey;
-
-        std::string filename = filePath.filename().string();
-        std::string aadStr = "v1|" + filename;
-        std::vector<unsigned char> aad(aadStr.begin(), aadStr.end());
-
-        auto plaintextRes = CryptoUtils::decryptAES256GCM(ciphertextBlob, currentKey, aad);
-        if (!plaintextRes)
-        {
-            return std::unexpected(StoreError::DecryptionFailed);
-        }
-        std::vector<unsigned char> plaintext = *plaintextRes;
-
-        std::string jsonStr(plaintext.begin(), plaintext.end());
-        nlohmann::json j = nlohmann::json::parse(jsonStr);
-        LobbyData lobbyData = j.get<LobbyData>();
-
-        std::string historyFilename = Util::toHex(Hasher::getInstance().getHashMsg256(lobbyData.lobby_name)) + ".history.enc";
-        std::filesystem::path historyFilePath = std::filesystem::path(m_storeDir) / "lobbies" / historyFilename;
-
-        if (std::filesystem::exists(historyFilePath))
-        {
-            std::ifstream histFile(historyFilePath, std::ios::binary);
-            if (histFile)
+            OPENSSL_cleanse(bytes.data(), bytes.size());
+            const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - writeStarted).count();
+            const auto id = LogEvents::lobbyId(lobbyName);
+            SPDLOG_DEBUG("[STORE] lobby={} transaction={} write_ms={:.3f} | Journal synchronized", id, location.index, elapsed);
+            if (update.new_message) {
+                const auto &message = *update.new_message;
+                SPDLOG_INFO("[{}] lobby={} seq={} write_ms={:.3f} | Message persisted",
+                            message.direction == MessageDirection::OUT ? "MSG-OUT" : "MSG-IN", id, message.seq_num, elapsed);
+            }
+            if (update.peer_acked_seq_nums)
+                SPDLOG_INFO("[ACK] lobby={} ack={} | Peer receipts persisted", id, nlohmann::json(*update.peer_acked_seq_nums).dump());
+            if (update.status)
+                SPDLOG_INFO("[LOBBY] lobby={} status={} | State persisted", id,
+                            *update.status == LobbyStatus::HANDSHAKE_DONE ? "READY" :
+                            *update.status == LobbyStatus::CONFIRMATION_PENDING ? "CONFIRMATION_PENDING" :
+                            *update.status == LobbyStatus::ANOMALY ? "ANOMALY" : "PENDING");
+            if (update.is_hidden)
+                SPDLOG_INFO("[LOBBY] lobby={} hidden={} | Visibility persisted", id, *update.is_hidden);
+            try
             {
-                while (histFile.peek() != EOF)
+                observer->onUpdate(update, update.new_message ? journalMessageLoader(location) : MessageLoader{});
+                if (created)
+                    m_lobbyRegistry->add(observer);
+                ++m_transactionCount;
+                if (m_transactionCount >= compactionThreshold())
                 {
-                    uint32_t msgSize = 0;
-                    if (!histFile.read(reinterpret_cast<char *>(&msgSize), sizeof(msgSize)))
-                        break;
-
-                    if (msgSize == 0 || msgSize > 10 * 1024 * 1024)
-                    {
-                        SPDLOG_ERROR("Corrupted history file: invalid msgSize {}", msgSize);
-                        break;
-                    }
-
-                    uint64_t seqNum = 0;
-                    if (!histFile.read(reinterpret_cast<char *>(&seqNum), sizeof(seqNum)))
-                        break;
-
-                    std::vector<unsigned char> msgCiphertext(msgSize);
-                    if (!histFile.read(reinterpret_cast<char *>(msgCiphertext.data()), msgSize))
-                        break;
-
-                    std::string aadStrHist = "v1|" + historyFilename + "|" + std::to_string(seqNum);
-                    std::vector<unsigned char> aadHist(aadStrHist.begin(), aadStrHist.end());
-
-                    auto msgPlaintextRes = CryptoUtils::decryptAES256GCM(msgCiphertext, currentKey, aadHist);
-                    if (msgPlaintextRes)
-                    {
-                        std::string msgJsonStr(msgPlaintextRes->begin(), msgPlaintextRes->end());
-                        try
-                        {
-                            nlohmann::json msgJson = nlohmann::json::parse(msgJsonStr);
-                            auto parsedMsg = msgJson.get<ChatMessage>();
-                            lobbyData.history.messages.push_back(parsedMsg);
-                            if (parsedMsg.direction == MessageDirection::IN && parsedMsg.seq_num > 0)
-                            {
-                                if (!lobbyData.downloaded_seq_nums.acknowledges(static_cast<std::uint64_t>(parsedMsg.seq_num)))
-                                {
-                                    lobbyData.downloaded_seq_nums.selective.push_back(static_cast<std::uint64_t>(parsedMsg.seq_num));
-                                }
-                            }
-                            else if (parsedMsg.direction == MessageDirection::OUT && parsedMsg.seq_num > lobbyData.my_seq_num)
-                            {
-                                lobbyData.my_seq_num = parsedMsg.seq_num;
-                            }
-                        }
-                        catch (const std::exception &e)
-                        {
-                            SPDLOG_ERROR("Failed to parse history message: {}", e.what());
-                        }
-                    }
+                    compactUnlocked();
                 }
-                lobbyData.downloaded_seq_nums.compress();
+            }
+            catch (...)
+            {
+                m_needsRecovery = true;
+                throw StoreRecoveryRequired();
             }
         }
-
-        return lobbyData;
-    }
-    catch (const std::exception &e)
-    {
-        SPDLOG_ERROR("Error loading lobby data from {}: {} (Wrong Master Password "
-                     "or corrupted data?)",
-                     filePath.string(), e.what());
-        return std::unexpected(StoreError::Unknown);
-    }
+        return changed; });
 }
 
-void LobbyStore::populateLobbies()
+void LobbyStore::compact()
 {
-    std::filesystem::path lobbiesDir = std::filesystem::path(m_storeDir) / "lobbies";
-    if (!std::filesystem::exists(lobbiesDir))
-        return;
-
-    auto isEncFile = [](const auto &entry)
-    { return entry.path().string().ends_with(".enc") && !entry.path().string().ends_with(".history.enc"); };
-
-    for (const auto &entry : std::filesystem::directory_iterator(lobbiesDir) | std::views::filter(isEncFile))
-    {
-        auto dataRes = loadLobbyDataFromFile(entry.path());
-        if (dataRes && !dataRes->isEmpty())
+    runOnIoWorker([this]
+                  {
+        try
         {
-            auto lobby = std::make_shared<Lobby>(*dataRes);
-            m_lobbyListener->addObserver(lobby);
+            compactUnlocked();
+        }
+        catch (...)
+        {
+            m_needsRecovery = true;
+            throw;
+        } });
+}
+
+void LobbyStore::compactUnlocked()
+{
+    const auto compactStarted = std::chrono::steady_clock::now();
+    SPDLOG_INFO("[COMPACT] Compaction started transactions={}", m_transactionCount);
+    const std::filesystem::path finalPath = std::filesystem::path(m_storeDir) / "transactions.v1.enc";
+    const std::filesystem::path tempPath = std::filesystem::path(m_storeDir) / "transactions.v1.enc.compact.tmp";
+
+    std::error_code ec;
+    const auto bytesBefore = std::filesystem::file_size(finalPath, ec);
+    if (std::filesystem::exists(tempPath, ec))
+    {
+        std::filesystem::remove(tempPath, ec);
+    }
+
+    struct PendingMessageLoader
+    {
+        std::string lobbyName;
+        ChatMessage metadata;
+        EncryptedJournal::Location location;
+    };
+    std::vector<PendingMessageLoader> pendingLoaders;
+
+    auto observers = m_lobbyRegistry->all();
+
+    auto tempJournal = std::make_shared<EncryptedJournal>(tempPath);
+    {
+
+        for (const auto &obs : observers)
+        {
+            std::string lobbyName = obs->getLobbyName();
+            LobbyData state = obs->getLobbyDataWithoutHistory();
+
+            // 1. Write each chat message first so sequence numbers correspond to stored messages
+            constexpr std::size_t pageSize = 256;
+            for (std::size_t offset = 0, total = obs->historySize(); offset < total; offset += pageSize)
+            {
+                const auto messages = obs->historyPage(offset, pageSize);
+                for (const auto &msg : messages)
+                {
+                    LobbyUpdate msgUpdate;
+                    msgUpdate.new_message = msg;
+                    if (msg.direction == MessageDirection::OUT)
+                    {
+                        msgUpdate.my_seq_num = msg.seq_num;
+                    }
+                    nlohmann::json msgRecord{{"version", 1}, {"lobby", lobbyName}, {"update", msgUpdate}};
+                    std::string msgBytes = msgRecord.dump();
+                    auto loc = tempJournal->append(std::span<const unsigned char>(
+                                                       reinterpret_cast<const unsigned char *>(msgBytes.data()), msgBytes.size()),
+                                                   m_masterKey->bytes, false);
+                    OPENSSL_cleanse(msgBytes.data(), msgBytes.size());
+
+                    ChatMessage meta = msg;
+                    meta.content.clear();
+                    pendingLoaders.push_back({lobbyName, std::move(meta), loc});
+                }
+            }
+
+            // 2. Write the consolidated state snapshot for this lobby (metadata, ACKs, heartbeats, keys)
+            LobbyUpdate snapshot;
+            snapshot.status = state.metadata.status;
+            snapshot.my_pseudo = state.metadata.my_pseudo;
+            snapshot.other_pseudo = state.metadata.other_pseudo;
+            snapshot.fake_timezone = state.metadata.fake_timezone;
+            snapshot.read_messages_count = state.metadata.read_messages_count;
+            snapshot.is_hidden = state.metadata.is_hidden;
+            snapshot.anomaly_message = state.metadata.anomaly_message;
+            snapshot.handshake_error = state.metadata.handshake_error;
+            snapshot.last_heartbeat = state.metadata.last_heartbeat;
+
+            if (state.crypto)
+            {
+                snapshot.my_x25519_pub = state.crypto->my_x25519_pub;
+                snapshot.my_x25519_priv = state.crypto->my_x25519_priv;
+                snapshot.announced_x25519_pub = state.crypto->announced_x25519_pub;
+                snapshot.private_node_discussion = state.crypto->private_node_discussion;
+            }
+
+            snapshot.announced_seq_num = state.sync.announced_seq_num;
+            snapshot.dht_acked_seq_nums = state.sync.dht_acked_seq_nums;
+            snapshot.peer_acked_seq_nums = state.sync.peer_acked_seq_nums;
+            snapshot.resynced_seq_nums = state.sync.resynced_seq_nums;
+
+            nlohmann::json snapRecord{{"version", 1}, {"lobby", lobbyName}, {"update", snapshot}};
+            std::string snapBytes = snapRecord.dump();
+            tempJournal->append(std::span<const unsigned char>(
+                                    reinterpret_cast<const unsigned char *>(snapBytes.data()), snapBytes.size()),
+                                m_masterKey->bytes, false);
+            OPENSSL_cleanse(snapBytes.data(), snapBytes.size());
         }
     }
+
+    // Keep the compacted journal open: its record counter and exclusive lock
+    // must survive the rename. Reopening without replay would reset the counter.
+    syncPath(tempPath);
+    std::filesystem::rename(tempPath, finalPath);
+    m_journal = std::move(tempJournal);
+    syncPath(m_storeDir, true);
+
+    // Group loaders by lobby and update observers
+    std::map<std::string, std::vector<HistoryRecord>> newRecords;
+    for (auto &item : pendingLoaders)
+    {
+        newRecords[item.lobbyName].push_back({std::move(item.metadata),
+                                              journalMessageLoader(item.location)});
+    }
+
+    for (const auto &obs : observers)
+    {
+        std::string name = obs->getLobbyName();
+        obs->resetHistoryRecords(std::move(newRecords[name]));
+    }
+
+    SPDLOG_INFO("[COMPACT] Journal size before_bytes={} after_bytes={}", bytesBefore, std::filesystem::file_size(finalPath, ec));
+    m_transactionCount = 0;
+    SPDLOG_INFO("[COMPACT] Compaction completed lobbies={} elapsed_ms={}", observers.size(), std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - compactStarted).count());
+}
+
+std::size_t LobbyStore::compactionThreshold() const
+{
+    std::size_t totalHistory = 0;
+    for (const auto &obs : m_lobbyRegistry->all())
+    {
+        totalHistory += obs->historySize();
+    }
+    return std::max<std::size_t>(1000, totalHistory);
 }
 
 std::shared_ptr<LobbyObserver> LobbyStore::getLobby(const std::string &lobbyName)
 {
-    return m_lobbyListener->getObserver(lobbyName);
+    return m_lobbyRegistry->find(lobbyName);
 }
 
 std::shared_ptr<LobbyObserver> LobbyStore::getOrCreateLobby(const std::string &lobbyName)
 {
-    return m_lobbyListener->getOrCreateObserver(lobbyName, [&]() {
-        SPDLOG_INFO("Creating new lobby: {}", lobbyName);
+    return m_lobbyRegistry->getOrCreate(lobbyName, [&]()
+                                        {
+        SPDLOG_INFO("[STORE] Creating new lobby: {}", LogEvents::lobbyId(lobbyName));
         LobbyData lobbyData;
-        lobbyData.lobby_name = lobbyName;
-        return std::make_shared<Lobby>(lobbyData);
-    });
+        lobbyData.metadata.lobby_name = lobbyName;
+        return std::make_shared<Lobby>(lobbyData); });
 }
 
 std::vector<std::shared_ptr<LobbyObserver>> LobbyStore::getLobbies()
 {
-    return m_lobbyListener->getObservers();
+    return m_lobbyRegistry->all();
 }
 
 void LobbyStore::updateMasterPassword(const std::string &newPassword)
 {
-    std::promise<void> promise;
-    std::future<void> future = promise.get_future();
-
-    m_ioWorker.enqueue([this, newPassword, &promise]()
-                       {
-        try {
+    try
+    {
+        runOnIoWorker([this, pwd = SecureString(newPassword)]()
+                      {
             std::filesystem::path vaultPath = std::filesystem::path(m_storeDir) / "vault.enc";
             std::filesystem::path tmpVaultPath = vaultPath.string() + ".tmp";
 
             std::vector<unsigned char> newSalt(16);
-            if (RAND_bytes(newSalt.data(), static_cast<int>(newSalt.size())) != 1) {
+            if (RAND_bytes(newSalt.data(), static_cast<int>(newSalt.size())) != 1)
+            {
                 throw std::runtime_error("RAND_bytes failed");
             }
 
-            std::vector<unsigned char> newKek = CryptoUtils::deriveStoreKey(newPassword, newSalt);
-            
-            std::vector<unsigned char> currentDek = m_masterKey;
+            std::vector<unsigned char> newKek = CryptoUtils::deriveStoreKey(pwd, newSalt);
+
+            const auto &currentDek = m_masterKey->bytes;
 
             auto encryptedDekRes = CryptoUtils::encryptAES256GCM(currentDek, newKek);
             OPENSSL_cleanse(newKek.data(), newKek.size());
 
-            if (!encryptedDekRes) {
+            if (!encryptedDekRes)
+            {
                 throw std::runtime_error("Failed to encrypt DEK with new password");
             }
 
             std::vector<unsigned char> vaultData;
+            vaultData.reserve(newSalt.size() + encryptedDekRes->size());
             vaultData.insert(vaultData.end(), newSalt.begin(), newSalt.end());
             vaultData.insert(vaultData.end(), encryptedDekRes->begin(), encryptedDekRes->end());
 
             std::ofstream outFile(tmpVaultPath, std::ios::binary);
-            if (!outFile || !outFile.write(reinterpret_cast<const char*>(vaultData.data()), vaultData.size())) {
-                if (std::filesystem::exists(tmpVaultPath)) {
+            if (!outFile || !outFile.write(reinterpret_cast<const char *>(vaultData.data()), static_cast<std::streamsize>(vaultData.size())))
+            {
+                if (std::filesystem::exists(tmpVaultPath))
+                {
                     std::filesystem::remove(tmpVaultPath);
                 }
                 throw std::runtime_error("Failed to write new vault.tmp");
             }
             outFile.close();
-            if (outFile.fail()) {
-                if (std::filesystem::exists(tmpVaultPath)) {
+            if (outFile.fail())
+            {
+                if (std::filesystem::exists(tmpVaultPath))
+                {
                     std::filesystem::remove(tmpVaultPath);
                 }
                 throw std::runtime_error("Failed to close new vault.tmp");
@@ -479,27 +431,42 @@ void LobbyStore::updateMasterPassword(const std::string &newPassword)
             std::filesystem::permissions(tmpVaultPath, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write, std::filesystem::perm_options::replace, permEc);
 
             // Atomic rename guarantees the old vault is overwritten safely
+            syncPath(tmpVaultPath);
             std::filesystem::rename(tmpVaultPath, vaultPath);
+            syncPath(m_storeDir, true);
 
-            // Cleanup old vault_salt.bin if it still exists from old version
-            std::filesystem::path oldSaltPath = std::filesystem::path(m_storeDir) / "vault_salt.bin";
-            if (std::filesystem::exists(oldSaltPath)) {
-                std::filesystem::remove(oldSaltPath);
-            }
-
-            SPDLOG_INFO("Master password updated instantly via DEK re-encryption.");
-            promise.set_value();
-        } catch (...) {
-            promise.set_exception(std::current_exception());
-        } });
-
-    try
-    {
-        future.get();
+            SPDLOG_INFO("[VAULT] Password rotation synchronized"); });
     }
     catch (const std::exception &e)
     {
-        SPDLOG_ERROR("Failed to update master password: {}", e.what());
+        SPDLOG_ERROR("[VAULT] Failed to update master password: {}", e.what());
         throw; // Rethrow to propagate to the UI
     }
+}
+
+MessageLoader LobbyStore::journalMessageLoader(EncryptedJournal::Location location) const
+{
+    return [journal = m_journal, key = m_masterKey, location]
+    {
+        auto plain = journal->read(location, key->bytes);
+        ScopedCleanse plainGuard(plain);
+        return nlohmann::json::parse(plain.begin(), plain.end()).at("update").at("new_message").get<ChatMessage>();
+    };
+}
+
+std::expected<HandshakeTransitionResult, std::string> LobbyStore::advanceHandshake(
+    const std::string &lobbyName, const std::string &ownPayload,
+    std::int64_t sequence, const std::string &value, bool found)
+{
+    std::expected<HandshakeTransitionResult, std::string> result{HandshakeTransitionResult{}};
+    transact(lobbyName, [&](const LobbyData &state)
+             {
+        if (state.metadata.is_hidden ||
+            (state.metadata.status != LobbyStatus::PENDING_HANDSHAKE &&
+             state.metadata.status != LobbyStatus::CONFIRMATION_PENDING)) return LobbyUpdate{};
+        result = HandshakeStateEngine::processHandshakeTransition(ownPayload, state, sequence, value, found);
+        if (!result) return lobby::prepare(state, lobby::RecordHandshakeError{result.error()});
+        result->update.handshake_error = "";
+        return result->update; });
+    return result;
 }

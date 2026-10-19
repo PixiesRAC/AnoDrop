@@ -1,8 +1,8 @@
 #pragma once
 #include <array>
 #include <expected>
+#include <span>
 #include <string>
-#include <vector>
 
 #include <openssl/crypto.h>
 
@@ -13,9 +13,10 @@ class HandshakeKeyService
     {
         std::array<char, 32> publicKey;
         std::array<char, 64> privateKey;
+        std::string salt;
         std::string pubKeyHex;
         std::string targetIDHex;
-        ChannelKeys(const std::vector<unsigned char> &seed, const std::string &salt = "");
+        ChannelKeys(std::span<const unsigned char> seed, std::string saltValue = "");
         ~ChannelKeys()
         {
             OPENSSL_cleanse(privateKey.data(), privateKey.size());

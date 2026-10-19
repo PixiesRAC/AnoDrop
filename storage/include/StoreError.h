@@ -1,36 +1,8 @@
 #pragma once
+#include <stdexcept>
 
-enum class StoreError
-{
-    FileNotFound,
-    FileOpenFailed,
-    WriteFailed,
-    ReadFailed,
-    EncryptionFailed,
-    DecryptionFailed,
-    InvalidData,
-    Unknown
+class StoreRecoveryRequired : public std::runtime_error {
+public:
+    StoreRecoveryRequired() : std::runtime_error("Storage outcome may be durable; reopen the store before retrying") {}
 };
 
-[[nodiscard]] inline std::string storeErrorToString(StoreError error)
-{
-    switch (error)
-    {
-    case StoreError::FileNotFound:
-        return "FileNotFound";
-    case StoreError::FileOpenFailed:
-        return "FileOpenFailed";
-    case StoreError::WriteFailed:
-        return "WriteFailed";
-    case StoreError::ReadFailed:
-        return "ReadFailed";
-    case StoreError::EncryptionFailed:
-        return "EncryptionFailed";
-    case StoreError::DecryptionFailed:
-        return "DecryptionFailed";
-    case StoreError::InvalidData:
-        return "InvalidData";
-    default:
-        return "Unknown Error";
-    }
-}

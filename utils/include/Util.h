@@ -3,13 +3,8 @@
 #include <cstddef>
 #include <ranges>
 #include <string>
-// #include <vector>
-
-enum class IpProtocol
-{
-    IPv4,
-    IPv6
-};
+#include <string_view>
+#include <vector>
 
 namespace Util
 {
@@ -21,6 +16,10 @@ template <ByteRange T>
 [[nodiscard]] inline std::string toHex(const T &bytes)
 {
     std::string hex;
+    if constexpr (std::ranges::sized_range<T>)
+    {
+        hex.reserve(std::ranges::size(bytes) * 2);
+    }
     const char hexChars[] = "0123456789abcdef";
     for (auto b : bytes)
     {
@@ -31,7 +30,7 @@ template <ByteRange T>
     return hex;
 }
 
-[[nodiscard]] inline std::vector<unsigned char> fromHex(const std::string &hex)
+[[nodiscard]] inline std::vector<unsigned char> fromHex(std::string_view hex)
 {
     std::vector<unsigned char> bytes;
     if (hex.length() % 2 != 0)

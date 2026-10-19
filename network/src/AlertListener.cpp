@@ -2,99 +2,47 @@
 
 #include <spdlog/spdlog.h>
 
-AlertListener::AlertListener(std::shared_ptr<lt::session> session) : m_session(std::move(session))
+AlertListener::AlertListener(std::shared_ptr<lt::session> session, AlertObserver &observer)
+    : m_session(std::move(session)), m_observer(observer)
 {
+    if (!m_session)
+        throw std::invalid_argument("AlertListener requires a session");
 }
 
-AlertListener::~AlertListener()
+void AlertListener::checkForAlerts(std::stop_token stop)
 {
-    SPDLOG_INFO("~AlertListener: clearing observers and stopping alert thread...");
-    std::unique_lock<std::shared_mutex> lock(m_observersMutex);
-    m_observers.clear();
-    SPDLOG_INFO("~AlertListener: cleared observers.");
-}
-
-void AlertListener::addObserver(AlertObserver *observer)
-{
-    if (observer != nullptr)
+    auto dispatch = [](auto &&callback)
     {
-        std::unique_lock<std::shared_mutex> lock(m_observersMutex);
-        if (std::find(m_observers.begin(), m_observers.end(), observer) == m_observers.end())
+        try
         {
-            m_observers.push_back(observer);
+            callback();
         }
-    }
-}
-
-void AlertListener::removeObserver(AlertObserver *observer)
-{
-    std::unique_lock<std::shared_mutex> lock(m_observersMutex);
-    auto it = std::find(m_observers.begin(), m_observers.end(), observer);
-    if (it != m_observers.end())
-    {
-        m_observers.erase(it);
-    }
-}
-
-void AlertListener::checkForAlerts(std::stop_token st)
-{
-    while (!st.stop_requested())
+        catch (const std::exception &e)
+        {
+            SPDLOG_ERROR("[DHT] Alert callback failed: {}", e.what());
+        }
+        catch (...)
+        {
+            SPDLOG_ERROR("[DHT] Alert callback threw a non-standard exception");
+        }
+    };
+    std::vector<lt::alert *> alerts;
+    while (!stop.stop_requested())
     {
         m_session->wait_for_alert(std::chrono::milliseconds(200));
-        if (st.stop_requested())
-        {
+        if (stop.stop_requested())
             break;
-        }
-
-        std::vector<lt::alert *> alerts;
+        alerts.clear();
         m_session->pop_alerts(&alerts);
-
-        if (!alerts.empty())
+        for (auto *alert : alerts)
         {
-            std::shared_lock<std::shared_mutex> lock(m_observersMutex);
-            for (lt::alert *alert : alerts)
-            {
-                if (st.stop_requested())
-                {
-                    break;
-                }
-                for (AlertObserver *observer : m_observers)
-                {
-                    try
-                    {
-                        observer->onAlert(alert);
-                    }
-                    catch (const std::exception &e)
-                    {
-                        SPDLOG_ERROR("Exception in observer onAlert: {}", e.what());
-                    }
-                }
-            }
+            if (stop.stop_requested())
+                break;
+            dispatch([&]
+                     { m_observer.onAlert(alert); });
         }
-
-        if (st.stop_requested())
-        {
-            break;
-        }
-
-        {
-            std::shared_lock<std::shared_mutex> lock(m_observersMutex);
-            for (AlertObserver *observer : m_observers)
-            {
-                if (st.stop_requested())
-                {
-                    break;
-                }
-                try
-                {
-                    observer->onTick();
-                }
-                catch (const std::exception &e)
-                {
-                    SPDLOG_ERROR("Exception in observer onTick: {}", e.what());
-                }
-            }
-        }
+        if (!stop.stop_requested())
+            dispatch([&]
+                     { m_observer.onTick(); });
     }
 }
-

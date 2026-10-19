@@ -1,85 +1,80 @@
 #include "IoWorker.h"
 
-#include <sched.h>
 #include <spdlog/spdlog.h>
 
-IoWorker::IoWorker()
+IoWorker::IoWorker() : m_worker([state = m_state]
+                                { workerLoop(state); })
 {
-    m_worker = std::jthread(&IoWorker::workerLoop, this);
 }
 
 IoWorker::~IoWorker()
 {
-    stopAndDrain();
+    if (isCurrentWorker())
+    {
+        // State survives until the draining worker exits; it never accesses this.
+        {
+            std::lock_guard lock(m_state->mutex);
+            m_state->closed = true;
+        }
+        m_worker.detach();
+    }
+    else
+        stopAndDrain();
 }
 
 void IoWorker::stopAndDrain()
 {
     {
-        std::lock_guard<std::mutex> lock(m_queueMutex);
-        m_stopRequested = true;
+        std::lock_guard lock(m_state->mutex);
+        m_state->closed = true;
     }
-    m_queueCv.notify_all();
-    if (m_worker.joinable())
-    {
-        m_worker.request_stop();
-        m_worker.join();
-    }
+    m_state->ready.notify_all();
+    if (isCurrentWorker())
+        return;
+    std::call_once(m_joinOnce, [this]
+                   { if (m_worker.joinable()) m_worker.join(); });
 }
 
-void IoWorker::enqueue(std::function<void()> task)
+bool IoWorker::enqueue(std::function<void()> task)
 {
     {
-        std::lock_guard<std::mutex> lock(m_queueMutex);
-        m_taskQueue.push(std::move(task));
+        std::lock_guard lock(m_state->mutex);
+        if (m_state->closed || m_state->tasks.size() >= 1024)
+            return false;
+        m_state->tasks.push(std::move(task));
     }
-    m_queueCv.notify_one();
+    m_state->ready.notify_one();
+    return true;
 }
 
-void IoWorker::workerLoop(std::stop_token stoken)
+void IoWorker::workerLoop(std::shared_ptr<State> state)
 {
-    std::thread::id threadId = std::this_thread::get_id();
-    int coreId = sched_getcpu();
-    SPDLOG_INFO("IoWorker thread started. Thread ID: {}, Core: {}",
-                std::hash<std::thread::id>{}(threadId), coreId);
-
+    s_current = state.get();
     while (true)
     {
         std::function<void()> task;
         {
-            std::unique_lock<std::mutex> lock(m_queueMutex);
-            m_queueCv.wait(lock, [this, &stoken]()
-                           { return !m_taskQueue.empty() || m_stopRequested || stoken.stop_requested(); });
-
-            if ((m_stopRequested || stoken.stop_requested()) && m_taskQueue.empty())
-            {
+            std::unique_lock lock(state->mutex);
+            state->ready.wait(lock, [&]
+                              { return state->closed || !state->tasks.empty(); });
+            if (state->tasks.empty())
                 break;
-            }
-
-            if (!m_taskQueue.empty())
-            {
-                task = std::move(m_taskQueue.front());
-                m_taskQueue.pop();
-            }
+            task = std::move(state->tasks.front());
+            state->tasks.pop();
         }
-
-        if (task)
+        try
         {
-            int currentCore = sched_getcpu();
-            SPDLOG_DEBUG("IoWorker executing task on Thread ID: {}, Core: {}",
-                         std::hash<std::thread::id>{}(std::this_thread::get_id()), currentCore);
-            try
-            {
+            if (task)
                 task();
-            }
-            catch (const std::exception &e)
-            {
-                SPDLOG_ERROR("IoWorker: Unhandled exception in task: {}", e.what());
-            }
-            catch (...)
-            {
-                SPDLOG_ERROR("IoWorker: Unknown exception in task");
-            }
+        }
+        catch (const std::exception &e)
+        {
+            SPDLOG_ERROR("[BOOT] IoWorker task failed: {}", e.what());
+        }
+        catch (...)
+        {
+            SPDLOG_ERROR("[BOOT] IoWorker task threw a non-standard exception");
         }
     }
+    s_current = nullptr;
 }

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "DhtChat.h"
+#include "ChatTaskWorker.h"
 #include "LobbyData.h"
 #include "LobbyObserver.h"
 
@@ -22,7 +23,6 @@ struct FormattedMessageLine
     int statusColorPair{0};
     int textColorPair{1};
     bool isBold{false};
-    bool isOutgoing{false};
     int displayX{2};
 };
 
@@ -52,7 +52,6 @@ class ChatViewModel
     [[nodiscard]] int getScrollOffset() const noexcept { return m_scrollOffset; }
     [[nodiscard]] int getMaxScroll() const noexcept { return m_maxScroll; }
     [[nodiscard]] bool hasMessages() const noexcept { return m_totalMessageCount > 0; }
-    [[nodiscard]] size_t getTotalMessageCount() const noexcept { return m_totalMessageCount; }
 
     void setDimensions(int chatAreaHeight, int screenWidth);
     void cycleFocus();
@@ -63,28 +62,27 @@ class ChatViewModel
     void pageDown();
     void appendInputChar(char c);
     void deleteLastInputChar();
-    void clearInput();
 
     enum class EnterResult
     {
         None,
         ExitView,
-        MessageSent,
-        ResyncTriggered,
-        RateLimitHit
+        ResyncTriggered
     };
     [[nodiscard]] EnterResult handleEnter();
 
   private:
     void rebuildViewData();
+    bool collectCompletedWork();
+    void showSendError(SendError error);
     void triggerRateLimitWarning(int count);
     void indexNewMessages(std::span<const ChatMessage> messages);
-    std::string formatMessagePrefix(const ChatMessage &msg, const LobbyData &lobbyData) const;
+    std::string formatMessagePrefix(const ChatMessage &msg, const LobbyViewData &lobbyData) const;
 
     std::shared_ptr<LobbyObserver> m_lobbyObserver;
     DhtChat *m_dhtChat;
 
-    LobbyData m_lobbyData;
+    LobbyViewData m_lobbyData;
     HeaderViewModel m_header;
     std::vector<FormattedMessageLine> m_visibleLines;
 
@@ -105,8 +103,22 @@ class ChatViewModel
     std::map<std::int64_t, std::vector<std::int64_t>> m_origToResyncs;
     std::map<std::int64_t, std::int64_t> m_resyncToOrig;
 
+    struct HistoryPage {
+        std::size_t offset{}, count{}, total{}, indexOffset{};
+        bool loadedVisible{};
+        std::vector<ChatMessage> visible, toIndex;
+    };
+    std::future<HistoryPage> m_historyFuture;
+    std::future<std::expected<std::int64_t, SendError>> m_sendFuture;
+    std::future<int> m_resyncFuture;
+    std::future<std::size_t> m_readFuture;
+    std::string m_submittedInput;
+    HistoryPage m_cachedPage;
+    bool m_hasCachedPage{false};
+    std::size_t m_markedReadCount{};
     bool m_lastConnectedState{false};
     bool m_dimensionsChanged{false};
+    ChatTaskWorker m_tasks; // Declared last: drained first during destruction.
 };
 
 } // namespace ui

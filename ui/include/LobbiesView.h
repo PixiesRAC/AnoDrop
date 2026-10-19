@@ -1,7 +1,6 @@
 #pragma once
 
 #include "AppFacade.h"
-#include "DhtChatHandler.h"
 #include "IView.h"
 
 namespace ui

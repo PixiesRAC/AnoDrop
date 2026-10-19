@@ -1,234 +1,217 @@
-#include <nlohmann/json.hpp>
-#include "LobbyDataSerializer.h"
 #include "Lobby.h"
 
-#include <iostream>
+#include <charconv>
 #include <ranges>
 #include <spdlog/spdlog.h>
 
+#include "ChatConstants.h"
+#include "LobbyUpdate.h"
+
 Lobby::~Lobby() = default;
 
-void Lobby::onUpdate(nlohmann::json &jsonPatch)
+void Lobby::onUpdate(LobbyUpdate &update, MessageLoader loader)
 {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
 
-    nlohmann::json cleanPatch = jsonPatch;
-
-    if (cleanPatch.contains("new_message"))
-    {
-        try
-        {
-            auto msg = cleanPatch["new_message"].get<ChatMessage>();
-            auto& messages = m_lobbyData.history.messages;
-            
-            // Deduplication and Migration check (O(1) for recent messages)
-            bool isDuplicate = false;
-            
-            // Limit deduplication to the last 50 messages to ensure O(1) performance
-            auto view = std::views::reverse(messages) | std::views::take(50);
-            for (const auto& existing : view)
-            {
-                if (existing.seq_num == msg.seq_num && existing.direction == msg.direction)
-                {
-                    isDuplicate = true;
-                    break;
-                }
-            }
-            if (!isDuplicate)
-            {
-                m_hasUpdate.store(true, std::memory_order_release);
-            }
-            else
-            {
-                // Remove it from the original patch so LobbyStore doesn't blindly append it to disk
-                jsonPatch.erase("new_message");
-            }
-
-            if (msg.direction == MessageDirection::IN)
-            {
-                if (msg.seq_num > 0 && !m_lobbyData.downloaded_seq_nums.acknowledges(static_cast<std::uint64_t>(msg.seq_num)))
-                {
-                    m_lobbyData.downloaded_seq_nums.selective.push_back(static_cast<std::uint64_t>(msg.seq_num));
-                }
-                
-                std::string resyncPrefix = "[Resync of Seq:";
-                if (msg.content.find(resyncPrefix) == 0)
-                {
-                    try {
-                        std::string seqStr = msg.content.substr(resyncPrefix.length());
-                        std::int64_t seq = std::stoll(seqStr);
-                        if (seq > 0 && !m_lobbyData.downloaded_seq_nums.acknowledges(static_cast<std::uint64_t>(seq)))
-                        {
-                            m_lobbyData.downloaded_seq_nums.selective.push_back(static_cast<std::uint64_t>(seq));
-                        }
-                    } catch(...) {}
-                }
-
-                // Compress the AckState window
-                m_lobbyData.downloaded_seq_nums.compress();
-            }
-            else if (msg.direction == MessageDirection::OUT)
-            {
-                if (msg.seq_num > m_lobbyData.my_seq_num)
-                {
-                    m_lobbyData.my_seq_num = msg.seq_num;
-                }
-            }
-
-            if (!isDuplicate)
-            {
-                messages.push_back(std::move(msg));
-            }
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Error parsing new_message: " << e.what() << std::endl;
-        }
-        cleanPatch.erase("new_message");
-    }
-
-    if (cleanPatch.contains("message_sent_confirm"))
-    {
-        std::int64_t seq = cleanPatch["message_sent_confirm"].get<std::int64_t>();
-        if (!m_lobbyData.dht_acked_seq_nums.acknowledges(static_cast<std::uint64_t>(seq)))
-        {
-            m_lobbyData.dht_acked_seq_nums.selective.push_back(static_cast<std::uint64_t>(seq));
-            m_lobbyData.dht_acked_seq_nums.compress();
-
-            m_hasUpdate = true;
-        }
-
-        if (m_pendingResyncs.count(seq))
-        {
-            std::int64_t old_seq = m_pendingResyncs[seq];
-            auto rpos = std::lower_bound(m_lobbyData.resynced_seq_nums.begin(), m_lobbyData.resynced_seq_nums.end(), old_seq);
-            if (rpos == m_lobbyData.resynced_seq_nums.end() || *rpos != old_seq)
-            {
-                m_lobbyData.resynced_seq_nums.insert(rpos, old_seq);
-            }
-            m_pendingResyncs.erase(seq);
-            m_hasUpdate = true;
-        }
-
-        cleanPatch.erase("message_sent_confirm");
-    }
-
-    if (cleanPatch.contains("add_pending_resyncs"))
-    {
-        auto newPending = cleanPatch["add_pending_resyncs"].get<std::map<std::int64_t, std::int64_t>>();
-        for (const auto &[k, v] : newPending)
-        {
-            m_pendingResyncs[k] = v;
-        }
-        cleanPatch.erase("add_pending_resyncs");
-    }
-
-    if (cleanPatch.contains("message_resynced"))
-    {
-        std::vector<std::int64_t> seqs = cleanPatch["message_resynced"].get<std::vector<std::int64_t>>();
-        for (std::int64_t seq : seqs)
-        {
-            auto pos = std::lower_bound(m_lobbyData.resynced_seq_nums.begin(), m_lobbyData.resynced_seq_nums.end(), seq);
-            if (pos == m_lobbyData.resynced_seq_nums.end() || *pos != seq)
-            {
-                m_lobbyData.resynced_seq_nums.insert(pos, seq);
-                m_hasUpdate = true;
-            }
-        }
-        cleanPatch.erase("message_resynced");
-    }
-
-    if (cleanPatch.empty())
+    update = normalizeUpdateUnlocked(std::move(update));
+    if (update.empty())
         return;
-
+    auto next = m_lobbyData.cloneWithoutHistory();
     bool changed = false;
-    for (auto it = cleanPatch.begin(); it != cleanPatch.end(); ++it)
+
+    if (update.new_message.has_value())
     {
-        const auto &key = it.key();
-        const auto &val = it.value();
+        const auto &msg = *update.new_message;
+
+        // normalizeUpdateUnlocked already removed duplicates under this lock.
+        changed = true;
+
+        if (msg.direction == MessageDirection::IN)
+        {
+            if (msg.seq_num > 0 && !next.sync.downloaded_seq_nums.acknowledges(static_cast<std::uint64_t>(msg.seq_num)))
+            {
+                next.sync.downloaded_seq_nums.selective.push_back(static_cast<std::uint64_t>(msg.seq_num));
+            }
+
+            if (msg.content.starts_with(chat::RESYNC_PREFIX))
+            {
+                std::string_view rest = std::string_view(msg.content).substr(chat::RESYNC_PREFIX.size());
+                std::int64_t seq = 0;
+                auto [ptr, ec] = std::from_chars(rest.data(), rest.data() + rest.size(), seq);
+                if (ec == std::errc() && seq > 0 && !next.sync.downloaded_seq_nums.acknowledges(static_cast<std::uint64_t>(seq)))
+                {
+                    next.sync.downloaded_seq_nums.selective.push_back(static_cast<std::uint64_t>(seq));
+                }
+            }
+
+            // Compress the AckState window
+            next.sync.downloaded_seq_nums.compress();
+        }
+        else if (msg.direction == MessageDirection::OUT)
+        {
+            if (msg.seq_num > next.sync.my_seq_num)
+            {
+                next.sync.my_seq_num = msg.seq_num;
+            }
+        }
+    }
+
+    if (update.message_sent_confirm.has_value())
+    {
+        std::int64_t seq = *update.message_sent_confirm;
+        if (!next.sync.dht_acked_seq_nums.acknowledges(static_cast<std::uint64_t>(seq)))
+        {
+            next.sync.dht_acked_seq_nums.selective.push_back(static_cast<std::uint64_t>(seq));
+            next.sync.dht_acked_seq_nums.compress();
+            changed = true;
+        }
+    }
+
+    auto assignIfPresent = [&changed](auto &target, const auto &value)
+    {
+        if (value && target != *value)
+        {
+            target = *value;
+            changed = true;
+        }
+    };
+    assignIfPresent(next.metadata.handshake_error, update.handshake_error);
+    assignIfPresent(next.metadata.status, update.status);
+    assignIfPresent(next.metadata.my_pseudo, update.my_pseudo);
+    assignIfPresent(next.metadata.other_pseudo, update.other_pseudo);
+    assignIfPresent(next.metadata.fake_timezone, update.fake_timezone);
+    assignIfPresent(next.metadata.read_messages_count, update.read_messages_count);
+    assignIfPresent(next.metadata.is_hidden, update.is_hidden);
+    assignIfPresent(next.metadata.anomaly_message, update.anomaly_message);
+    assignIfPresent(next.metadata.last_heartbeat, update.last_heartbeat);
+    if (update.my_x25519_pub || update.my_x25519_priv || update.announced_x25519_pub || update.private_node_discussion)
+    {
+        auto vault = std::make_shared<LobbyCryptoVault>();
+        const std::string curPub = next.crypto ? next.crypto->my_x25519_pub : "";
+        const SecureString curPriv = next.crypto ? next.crypto->my_x25519_priv : SecureString{};
+        const std::string curAnn = next.crypto ? next.crypto->announced_x25519_pub : "";
+        const SecureString curDisc = next.crypto ? next.crypto->private_node_discussion : SecureString{};
+        vault->my_x25519_pub = update.my_x25519_pub.value_or(curPub);
+        vault->my_x25519_priv = update.my_x25519_priv.value_or(curPriv);
+        vault->announced_x25519_pub = update.announced_x25519_pub.value_or(curAnn);
+        vault->private_node_discussion = update.private_node_discussion.value_or(curDisc);
+        changed = changed || (!next.crypto || !(*vault == *next.crypto));
+        next.crypto = std::move(vault);
+    }
+    assignIfPresent(next.sync.my_seq_num, update.my_seq_num);
+    assignIfPresent(next.sync.announced_seq_num, update.announced_seq_num);
+    assignIfPresent(next.sync.dht_acked_seq_nums, update.dht_acked_seq_nums);
+    assignIfPresent(next.sync.peer_acked_seq_nums, update.peer_acked_seq_nums);
+    assignIfPresent(next.sync.resynced_seq_nums, update.resynced_seq_nums);
+    if (update.new_message)
+    {
+        HistoryRecord record{*update.new_message, std::move(loader)};
+        if (record.load)
+            record.metadata.content.clear();
+        auto &records = m_lobbyData.history.records;
+        if (records.size() == records.capacity())
+            records.reserve(records.size() + std::max<std::size_t>(records.size(), 1));
+        const auto identity = std::pair{record.metadata.direction, record.metadata.seq_num};
+        const auto inserted = m_messageIds.emplace(identity);
         try
         {
-            if (key == "status") {
-                auto newStatus = val.is_number() ? static_cast<LobbyStatus>(val.get<int>()) : val.get<LobbyStatus>();
-                if (m_lobbyData.status != newStatus) { m_lobbyData.status = newStatus; changed = true; }
-            }
-            else if (key == "my_pseudo") {
-                auto s = val.get<std::string>();
-                if (m_lobbyData.my_pseudo != s) { m_lobbyData.my_pseudo = std::move(s); changed = true; }
-            }
-            else if (key == "other_pseudo") {
-                auto s = val.get<std::string>();
-                if (m_lobbyData.other_pseudo != s) { m_lobbyData.other_pseudo = std::move(s); changed = true; }
-            }
-            else if (key == "my_x25519_pub") {
-                auto s = val.get<std::string>();
-                if (m_lobbyData.my_x25519_pub != s) { m_lobbyData.my_x25519_pub = std::move(s); changed = true; }
-            }
-            else if (key == "my_x25519_priv") {
-                auto s = val.get<std::string>();
-                if (m_lobbyData.my_x25519_priv != s) { m_lobbyData.my_x25519_priv = std::move(s); changed = true; }
-            }
-            else if (key == "announced_x25519_pub") {
-                auto s = val.get<std::string>();
-                if (m_lobbyData.announced_x25519_pub != s) { m_lobbyData.announced_x25519_pub = std::move(s); changed = true; }
-            }
-            else if (key == "private_node_discussion") {
-                auto s = val.get<std::string>();
-                if (m_lobbyData.private_node_discussion != s) { m_lobbyData.private_node_discussion = std::move(s); changed = true; }
-            }
-            else if (key == "my_seq_num") {
-                auto n = val.get<std::int64_t>();
-                if (m_lobbyData.my_seq_num != n) { m_lobbyData.my_seq_num = n; changed = true; }
-            }
-            else if (key == "announced_seq_num") {
-                auto n = val.get<std::int64_t>();
-                if (m_lobbyData.announced_seq_num != n) { m_lobbyData.announced_seq_num = n; changed = true; }
-            }
-            else if (key == "dht_acked_seq_nums") {
-                auto a = val.get<AckState>();
-                if (m_lobbyData.dht_acked_seq_nums != a) { m_lobbyData.dht_acked_seq_nums = std::move(a); changed = true; }
-            }
-            else if (key == "peer_acked_seq_nums") {
-                auto a = val.get<AckState>();
-                if (m_lobbyData.peer_acked_seq_nums != a) { m_lobbyData.peer_acked_seq_nums = std::move(a); changed = true; }
-            }
-            else if (key == "downloaded_seq_nums") {
-                auto a = val.get<AckState>();
-                if (m_lobbyData.downloaded_seq_nums != a) { m_lobbyData.downloaded_seq_nums = std::move(a); changed = true; }
-            }
-            else if (key == "resynced_seq_nums") {
-                auto r = val.get<std::vector<std::int64_t>>();
-                if (m_lobbyData.resynced_seq_nums != r) { m_lobbyData.resynced_seq_nums = std::move(r); changed = true; }
-            }
-            else if (key == "fake_timezone") {
-                auto tz = val.get<FakeTimezone>();
-                if (m_lobbyData.fake_timezone != tz) { m_lobbyData.fake_timezone = std::move(tz); changed = true; }
-            }
-            else if (key == "read_messages_count") {
-                auto c = val.get<std::size_t>();
-                if (m_lobbyData.read_messages_count != c) { m_lobbyData.read_messages_count = c; changed = true; }
-            }
-            else if (key == "is_hidden") {
-                auto h = val.get<bool>();
-                if (m_lobbyData.is_hidden != h) { m_lobbyData.is_hidden = h; changed = true; }
-            }
-            else if (key == "anomaly_message") {
-                auto s = val.get<std::string>();
-                if (m_lobbyData.anomaly_message != s) { m_lobbyData.anomaly_message = std::move(s); changed = true; }
-            }
-            else if (key == "last_heartbeat") {
-                auto t = val.get<int64_t>();
-                if (m_lobbyData.last_heartbeat != t) { m_lobbyData.last_heartbeat = t; changed = true; }
-            }
+            if (record.metadata.direction == MessageDirection::OUT)
+                m_outgoingIndex.emplace(record.metadata.seq_num, records.size());
         }
-        catch (const std::exception &e)
+        catch (...)
         {
-            SPDLOG_WARN("Error patching field '{}': {}", key, e.what());
+            if (inserted.second)
+                m_messageIds.erase(inserted.first);
+            throw;
         }
+        static_assert(std::is_nothrow_move_constructible_v<HistoryRecord>);
+        records.push_back(std::move(record)); // Reserved capacity and noexcept move.
     }
-
+    using std::swap;
+    static_assert(std::is_nothrow_swappable_v<LobbyMetadata>);
+    static_assert(std::is_nothrow_swappable_v<LobbySyncState>);
+    swap(m_lobbyData.metadata, next.metadata);
+    swap(m_lobbyData.sync, next.sync);
+    swap(m_lobbyData.crypto, next.crypto);
     if (changed)
-    {
         m_hasUpdate.store(true, std::memory_order_release);
+}
+
+LobbyUpdate Lobby::normalizeUpdateUnlocked(LobbyUpdate update) const
+{
+    const auto &state = m_lobbyData;
+    if (update.new_message && (update.new_message->seq_num <= 0 ||
+                               (update.new_message->direction != MessageDirection::IN && update.new_message->direction != MessageDirection::OUT)))
+        throw std::invalid_argument("Invalid message identity");
+    if (update.my_seq_num && *update.my_seq_num < state.sync.my_seq_num)
+        throw std::invalid_argument("Outgoing sequence cannot regress");
+    if (update.announced_seq_num && *update.announced_seq_num < 0)
+        throw std::invalid_argument("Invalid announced sequence");
+    const auto messageSeq = update.new_message && update.new_message->direction == MessageDirection::OUT
+                                ? update.new_message->seq_num
+                                : state.sync.my_seq_num;
+    const auto issued = std::max(state.sync.my_seq_num, messageSeq);
+    if (update.my_seq_num && *update.my_seq_num != issued)
+        throw std::invalid_argument("Outgoing sequence must correspond to a stored message");
+    if (update.message_sent_confirm && (*update.message_sent_confirm <= 0 || *update.message_sent_confirm > issued))
+        throw std::invalid_argument("Confirmation exceeds issued sequence");
+    auto mergeReceipts = [issued](std::optional<AckState> &requested, const AckState &current)
+    {
+        if (!requested)
+            return;
+        if (requested->through > static_cast<std::uint64_t>(issued) || std::ranges::any_of(requested->selective,
+                                                                                           [issued](auto seq)
+                                                                                           { return seq > static_cast<std::uint64_t>(issued); }))
+            throw std::invalid_argument("ACK exceeds issued sequence");
+        requested->through = std::max(requested->through, current.through);
+        requested->selective.insert(requested->selective.end(), current.selective.begin(), current.selective.end());
+        requested->compress();
+        if (*requested == current)
+            requested.reset();
+    };
+    mergeReceipts(update.peer_acked_seq_nums, state.sync.peer_acked_seq_nums);
+    mergeReceipts(update.dht_acked_seq_nums, state.sync.dht_acked_seq_nums);
+    if (update.new_message && m_messageIds.contains({update.new_message->direction, update.new_message->seq_num}))
+        update.new_message.reset();
+    if (update.message_sent_confirm && state.sync.dht_acked_seq_nums.acknowledges(static_cast<std::uint64_t>(*update.message_sent_confirm)))
+        update.message_sent_confirm.reset();
+    if (update.read_messages_count)
+    {
+        if (*update.read_messages_count > state.history.records.size() + (update.new_message ? 1u : 0u))
+            throw std::invalid_argument("Read cursor exceeds history size");
+        if (*update.read_messages_count <= state.metadata.read_messages_count)
+            update.read_messages_count.reset();
     }
+    if (update.announced_seq_num && *update.announced_seq_num <= state.sync.announced_seq_num)
+        update.announced_seq_num.reset();
+    auto omitUnchanged = [](auto &field, const auto &current)
+    {
+        if (field && *field == current)
+            field.reset();
+    };
+    omitUnchanged(update.handshake_error, state.metadata.handshake_error);
+    omitUnchanged(update.status, state.metadata.status);
+    omitUnchanged(update.my_pseudo, state.metadata.my_pseudo);
+    omitUnchanged(update.other_pseudo, state.metadata.other_pseudo);
+    omitUnchanged(update.fake_timezone, state.metadata.fake_timezone);
+    omitUnchanged(update.is_hidden, state.metadata.is_hidden);
+    omitUnchanged(update.anomaly_message, state.metadata.anomaly_message);
+    omitUnchanged(update.last_heartbeat, state.metadata.last_heartbeat);
+    omitUnchanged(update.my_seq_num, state.sync.my_seq_num);
+    if (state.crypto)
+    {
+        omitUnchanged(update.my_x25519_pub, state.crypto->my_x25519_pub);
+        omitUnchanged(update.my_x25519_priv, state.crypto->my_x25519_priv);
+        omitUnchanged(update.announced_x25519_pub, state.crypto->announced_x25519_pub);
+        omitUnchanged(update.private_node_discussion, state.crypto->private_node_discussion);
+    }
+    if (update.resynced_seq_nums)
+    {
+        update.resynced_seq_nums->insert(update.resynced_seq_nums->end(), state.sync.resynced_seq_nums.begin(), state.sync.resynced_seq_nums.end());
+        auto &sequences = *update.resynced_seq_nums;
+        std::ranges::sort(sequences);
+        sequences.erase(std::unique(sequences.begin(), sequences.end()), sequences.end());
+        omitUnchanged(update.resynced_seq_nums, state.sync.resynced_seq_nums);
+    }
+    return update;
 }

@@ -2,6 +2,8 @@
 
 #include <cstdlib>
 #include <ncurses.h>
+#include <termios.h>
+#include <unistd.h>
 #include <spdlog/spdlog.h>
 
 #include "AnomalyFlagView.h"
@@ -13,16 +15,19 @@
 namespace ui
 {
 
-static void onQuickExitResetTerminal()
+namespace {
+termios initialTerminal{};
+bool haveInitialTerminal = false;
+void onQuickExitResetTerminal()
 {
-    if (!isendwin())
-    {
-        endwin();
-    }
+    // quick_exit may run on the network thread: never enter ncurses here.
+    if (haveInitialTerminal) ::tcsetattr(STDIN_FILENO, TCSANOW, &initialTerminal);
+}
 }
 
 GuiBuilder::GuiBuilder() : m_running(false), m_selectedOption(1)
 {
+    haveInitialTerminal = ::tcgetattr(STDIN_FILENO, &initialTerminal) == 0;
     initscr();
     cbreak();
     noecho();
@@ -55,15 +60,23 @@ void GuiBuilder::shutdown()
 
 GuiBuilder::~GuiBuilder()
 {
-    SPDLOG_INFO("~GuiBuilder: closing ncurses and shutting down...");
+    SPDLOG_INFO("[USER] ~GuiBuilder: closing ncurses and shutting down...");
     shutdown();
 }
 
 void GuiBuilder::resetTerminal()
 {
-    if (!isendwin())
+    if (stdscr != nullptr)
     {
-        endwin();
+        if (!isendwin())
+        {
+            endwin();
+        }
+        if (SCREEN *sp = set_term(nullptr))
+        {
+            set_term(sp);
+            delscreen(sp);
+        }
     }
 }
 
@@ -138,6 +151,7 @@ void GuiBuilder::buildAndRun()
             m_selectedOption++;
         else if (choice == 10 || choice == 13 || choice == KEY_ENTER)
         { // ENTER
+            SPDLOG_INFO("[USER] Menu selected action={}", m_selectedOption == 1 ? "handshake" : m_selectedOption == 2 ? "lobbies" : m_selectedOption == 3 ? "change_password" : m_selectedOption == 4 ? "report_anomaly" : "quit");
             if (m_selectedOption == 5)
             {
                 m_running = false;
@@ -169,7 +183,7 @@ void GuiBuilder::buildAndRun()
                 }
                 catch (const std::exception &e)
                 {
-                    SPDLOG_ERROR("Exception caught in view {}: {}", m_selectedOption, e.what());
+                    SPDLOG_ERROR("[USER] Exception caught in view {}: {}", m_selectedOption, e.what());
                 }
             }
         }

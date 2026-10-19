@@ -1,76 +1,113 @@
+#include "LogEvents.h"
 #include "PartitionedThreadPool.h"
 
+#include <algorithm>
 #include <spdlog/spdlog.h>
 #ifdef __linux__
 #include <sched.h>
 #endif
 
-PartitionedThreadPool::PartitionedThreadPool(size_t numThreads) : m_numThreads(numThreads)
+PartitionedThreadPool::PartitionedThreadPool(size_t numThreads, ThreadLauncher launch) : m_numThreads(numThreads)
 {
+    if (numThreads == 0)
+        throw std::invalid_argument("Thread pool needs at least one worker");
     m_workers.reserve(numThreads);
     m_threads.reserve(numThreads);
     for (size_t i = 0; i < numThreads; ++i)
     {
         m_workers.push_back(std::make_shared<WorkerState>());
     }
-    for (size_t i = 0; i < numThreads; ++i)
+    if (!launch)
+        launch = [](std::function<void()> task)
+        { return std::thread(std::move(task)); };
+    try
     {
-        m_threads.emplace_back(&PartitionedThreadPool::workerLoop, m_workers[i], static_cast<int>(i));
+        for (size_t i = 0; i < numThreads; ++i)
+        {
+            auto thread = launch([worker = m_workers[i], id = static_cast<int>(i)]
+                                 { workerLoop(worker, id); });
+            if (!thread.joinable())
+                throw std::runtime_error("Thread launcher returned no worker");
+            m_threads.push_back(std::move(thread));
+        }
+    }
+    catch (...)
+    {
+        // The destructor is not invoked when construction fails. Wake and join
+        // every worker already created before propagating the launch failure.
+        for (auto &worker : m_workers)
+        {
+            {
+                std::lock_guard lock(worker->queueMutex);
+                worker->closed = true;
+            }
+            worker->queueCv.notify_all();
+        }
+        for (auto &thread : m_threads)
+            if (thread.joinable())
+                thread.join();
+        throw;
     }
 }
 
 PartitionedThreadPool::~PartitionedThreadPool()
 {
     shutdown();
+    // If destruction was triggered by the last owner inside a task, shutdown
+    // only requested closure. State remains owned by the detached worker.
+    for (auto &thread : m_threads)
+    {
+        if (!thread.joinable())
+            continue;
+        if (thread.get_id() == std::this_thread::get_id())
+            thread.detach();
+        else
+            thread.join();
+    }
 }
 
 void PartitionedThreadPool::shutdown()
 {
+    // A worker must not wait on call_once while an external caller joins it.
+    const bool fromWorker = std::ranges::any_of(m_workers, [](const auto &state)
+                                                { return state.get() == s_currentWorker; });
+    if (fromWorker)
+    {
+        for (auto &state : m_workers)
+        {
+            {
+                std::lock_guard lock(state->queueMutex);
+                state->closed = true;
+            }
+            state->queueCv.notify_all();
+        }
+        return;
+    }
     std::call_once(m_shutdownOnce, [this]()
                    {
-        std::vector<std::queue<std::function<void()>>> cancelled;
-        cancelled.reserve(m_workers.size());
+        std::size_t cancelledCount = 0;
 
         for (auto &worker : m_workers)
         {
             {
                 std::lock_guard<std::mutex> lock(worker->queueMutex);
                 worker->closed = true;
-                cancelled.push_back(std::move(worker->taskQueue));
-                worker->taskQueue = {};
+                cancelledCount += worker->taskQueue.size();
             }
             worker->queueCv.notify_all();
         }
 
-        const auto self = std::this_thread::get_id();
-        for (auto &thread : m_threads)
-        {
-            if (!thread.joinable())
-                continue;
-            if (thread.get_id() == self)
-            {
-                // shutdown() reached from a task running on this very worker (e.g. it
-                // released the last owner). Joining would deadlock: detach instead.
-                // The worker holds its own shared_ptr<WorkerState> and never touches `this`.
-                SPDLOG_WARN("PartitionedThreadPool::shutdown called from one of its workers; detaching it");
-                thread.detach();
-            }
-            else
-            {
-                thread.join();
-            }
-        }
+        for (auto& thread : m_threads)
+            if (thread.joinable()) thread.join();
 
-        std::size_t cancelledCount = 0;
-        for (const auto &q : cancelled)
-            cancelledCount += q.size();
+        // Closed queues cannot receive new work. Destroy captures outside locks,
+        // after joining workers, without allocating a cancellation container.
+        for (auto& worker : m_workers)
+            while (!worker->taskQueue.empty()) worker->taskQueue.pop();
         if (cancelledCount > 0)
         {
-            SPDLOG_INFO("PartitionedThreadPool: {} pending task(s) cancelled at shutdown", cancelledCount);
-        }
-        // `cancelled` is destroyed here, on the thread calling shutdown(), after the
-        // workers are gone: captured resources are released deterministically.
-    });
+            SPDLOG_INFO("[BOOT] PartitionedThreadPool: {} pending task(s) cancelled at shutdown", cancelledCount);
+        } });
 }
 
 bool PartitionedThreadPool::enqueue(const std::string &partitionKey, std::function<void()> task)
@@ -79,9 +116,9 @@ bool PartitionedThreadPool::enqueue(const std::string &partitionKey, std::functi
     auto &worker = m_workers[index];
     {
         std::lock_guard<std::mutex> lock(worker->queueMutex);
-        if (worker->closed)
+        if (worker->closed || worker->taskQueue.size() >= 1024)
         {
-            SPDLOG_DEBUG("PartitionedThreadPool: task rejected for partition '{}' (pool closed)", partitionKey);
+            SPDLOG_DEBUG("[BOOT] PartitionedThreadPool: task rejected for partition {} (pool closed)", LogEvents::lobbyId(partitionKey));
             return false;
         }
         worker->taskQueue.push(std::move(task));
@@ -94,6 +131,7 @@ bool PartitionedThreadPool::enqueue(const std::string &partitionKey, std::functi
 
 void PartitionedThreadPool::workerLoop(std::shared_ptr<WorkerState> worker, int workerId)
 {
+    s_currentWorker = worker.get();
     while (true)
     {
         std::function<void()> task;
@@ -104,6 +142,7 @@ void PartitionedThreadPool::workerLoop(std::shared_ptr<WorkerState> worker, int 
 
             if (worker->closed)
             {
+                s_currentWorker = nullptr;
                 return;
             }
 
@@ -113,11 +152,6 @@ void PartitionedThreadPool::workerLoop(std::shared_ptr<WorkerState> worker, int 
 
         if (task)
         {
-#ifdef __linux__
-            SPDLOG_DEBUG("PartitionedThreadPool Worker {} executing task on CPU core {}", workerId, sched_getcpu());
-#else
-            SPDLOG_DEBUG("PartitionedThreadPool Worker {} executing task", workerId);
-#endif
             // Exception boundary: a failing task must not terminate the whole process.
             try
             {
@@ -125,7 +159,11 @@ void PartitionedThreadPool::workerLoop(std::shared_ptr<WorkerState> worker, int 
             }
             catch (const std::exception &e)
             {
-                SPDLOG_ERROR("PartitionedThreadPool Worker {}: task threw: {}", workerId, e.what());
+                SPDLOG_ERROR("[BOOT] PartitionedThreadPool Worker {}: task threw: {}", workerId, e.what());
+            }
+            catch (...)
+            {
+                SPDLOG_ERROR("[BOOT] PartitionedThreadPool Worker {}: task threw a non-standard exception", workerId);
             }
         }
     }

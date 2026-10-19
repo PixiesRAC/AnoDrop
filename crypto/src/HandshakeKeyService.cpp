@@ -1,14 +1,18 @@
+#include "LogEvents.h"
 #include "HandshakeKeyService.h"
 
+#include <cstring>
 #include <libtorrent/hasher.hpp>
 #include <libtorrent/kademlia/ed25519.hpp>
+#include <openssl/crypto.h>
 #include <spdlog/spdlog.h>
 
-#include <openssl/crypto.h>
 #include "CryptoUtils.h"
+#include "SecureBuffer.h"
 #include "Util.h"
 
-HandshakeKeyService::ChannelKeys::ChannelKeys(const std::vector<unsigned char> &seed, const std::string &salt)
+HandshakeKeyService::ChannelKeys::ChannelKeys(std::span<const unsigned char> seed, std::string saltValue)
+    : salt(std::move(saltValue))
 {
     if (seed.size() != 32)
     {
@@ -24,6 +28,8 @@ HandshakeKeyService::ChannelKeys::ChannelKeys(const std::vector<unsigned char> &
 
     publicKey = pk.bytes;
     privateKey = sk.bytes;
+    OPENSSL_cleanse(sk.bytes.data(), sk.bytes.size());
+    OPENSSL_cleanse(lt_seed.data(), lt_seed.size());
 
     pubKeyHex = Util::toHex(publicKey);
 
@@ -32,9 +38,8 @@ HandshakeKeyService::ChannelKeys::ChannelKeys(const std::vector<unsigned char> &
     {
         h.update(salt.data(), static_cast<int>(salt.size()));
     }
-    lt::sha1_hash targetID = h.final();
-    targetIDHex = Util::toHex(targetID.to_string());
-    OPENSSL_cleanse(lt_seed.data(), lt_seed.size());
+    const lt::sha1_hash targetID = h.final();
+    targetIDHex = Util::toHex(std::span<const char>(targetID.data(), targetID.size()));
 }
 
 std::expected<std::string, std::string> HandshakeKeyService::deriveSharedSecret(const std::string &myPrivHex, const std::string &peerPubHex, const std::string &lobbyName)
@@ -44,30 +49,30 @@ std::expected<std::string, std::string> HandshakeKeyService::deriveSharedSecret(
         if (!myPrivHex.empty() && !peerPubHex.empty())
         {
             std::vector<unsigned char> myPrivRaw = Util::fromHex(myPrivHex);
+            ScopedCleanse privateGuard(myPrivRaw);
             std::vector<unsigned char> peerPubRaw = Util::fromHex(peerPubHex);
+            ScopedCleanse peerGuard(peerPubRaw);
             auto sharedSecretRes = CryptoUtils::deriveX25519SharedSecret(myPrivRaw, peerPubRaw);
-            OPENSSL_cleanse(myPrivRaw.data(), myPrivRaw.size());
-            OPENSSL_cleanse(peerPubRaw.data(), peerPubRaw.size());
             if (!sharedSecretRes)
             {
-                SPDLOG_WARN("Failed to derive X25519 shared secret for lobby {}: {}", lobbyName, sharedSecretRes.error());
+                SPDLOG_WARN("[HANDSHAKE] Failed to derive X25519 shared secret for lobby {}: {}", LogEvents::lobbyId(lobbyName), sharedSecretRes.error());
                 return std::unexpected(sharedSecretRes.error());
             }
             std::vector<unsigned char> sharedSecret = std::move(*sharedSecretRes);
+            ScopedCleanse sharedGuard(sharedSecret);
             std::string hexSecret = Util::toHex(sharedSecret);
-            OPENSSL_cleanse(sharedSecret.data(), sharedSecret.size());
-            SPDLOG_INFO("Successfully derived X25519 shared secret for lobby {}", lobbyName);
+            SPDLOG_INFO("[HANDSHAKE] Successfully derived X25519 shared secret for lobby {}", LogEvents::lobbyId(lobbyName));
             return hexSecret;
         }
         else
         {
-            SPDLOG_WARN("Cannot derive shared secret: missing keys for lobby {}", lobbyName);
+            SPDLOG_WARN("[HANDSHAKE] Cannot derive shared secret: missing keys for lobby {}", LogEvents::lobbyId(lobbyName));
             return std::unexpected("Missing keys for lobby " + lobbyName);
         }
     }
     catch (const std::exception &e)
     {
-        SPDLOG_ERROR("Failed to derive shared secret for lobby {}: {}", lobbyName, e.what());
+        SPDLOG_ERROR("[HANDSHAKE] Failed to derive shared secret for lobby {}: {}", LogEvents::lobbyId(lobbyName), e.what());
         return std::unexpected(std::string("Exception deriving secret: ") + e.what());
     }
 }

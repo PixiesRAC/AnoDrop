@@ -1,0 +1,35 @@
+Language: Cpp
+BasedOnStyle: LLVM
+
+# Classic indentation (4 spaces)
+IndentWidth: 4
+UseTab: Never
+
+# "Line break after {" : Prevents blocks, functions, and conditions from being on a single line
+AllowShortBlocksOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+
+# Puts the `{` on a new line for functions, loops, ifs, etc. (Allman style)
+BreakBeforeBraces: Allman
+
+# "All parameters, declarations, and assignments must be on the same line"
+# We set ColumnLimit to 9999. A very large number forces clang-format to aggressively
+# pull multi-line statements back into a single line, fixing old line breaks.
+ColumnLimit: 0
+BinPackArguments: true
+BinPackParameters: true
+
+# Except for constructors: We force line breaks for constructor initialization lists
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+BreakConstructorInitializers: BeforeComma
+
+SortIncludes: true
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex:           '^<.*>'
+    Priority:        1
+  - Regex:           '.*'
+    Priority:        2

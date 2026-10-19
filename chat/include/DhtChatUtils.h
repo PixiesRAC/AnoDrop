@@ -1,11 +1,13 @@
 #pragma once
 
+#include <string>
+#include <cstdint>
+
 struct ChatPublishParams
 {
-    std::string encryptedPayload;
+    std::string payload;
     std::string lobbyName;
-    int64_t targetSeqNum;
+    std::int64_t targetSeqNum{};
     std::string sequenceTargetKey;
     std::string messageTargetKey;
-    std::string announcedTargetKey;
 };

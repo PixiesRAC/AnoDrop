@@ -7,15 +7,15 @@ class Config
   public:
     Config(int argc, char *argv[]);
 
-    [[nodiscard]] std::string getStorePath() const;
-    [[nodiscard]] std::string getLogPath() const;
-    [[nodiscard]] int getFetchInterval() const;
-    [[nodiscard]] int getArgon2Iterations() const;
-    [[nodiscard]] std::string getLogLevel() const;
-    [[nodiscard]] int getMaxConcurrentFetches() const;
-    [[nodiscard]] std::string getExtraSaltDataForLobbyHandshake() const;
-    [[nodiscard]] bool getPullMessagesOnStartup() const;
-    [[nodiscard]] std::string getNetworkInterface() const;
+    [[nodiscard]] const std::string &getStorePath() const noexcept;
+    [[nodiscard]] const std::string &getLogPath() const noexcept;
+    [[nodiscard]] int getFetchInterval() const noexcept;
+    [[nodiscard]] int getArgon2Iterations() const noexcept;
+    [[nodiscard]] const std::string &getLogLevel() const noexcept;
+    [[nodiscard]] int getMaxConcurrentFetches() const noexcept;
+    [[nodiscard]] const std::string &getExtraSaltDataForLobbyHandshake() const noexcept;
+    [[nodiscard]] bool getPullMessagesOnStartup() const noexcept;
+    [[nodiscard]] const std::string &getNetworkInterface() const noexcept;
 
   private:
     std::string m_storePath;

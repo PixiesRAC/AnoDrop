@@ -2,19 +2,21 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "SecureBuffer.h"
 #include "FakeTimezonePool.h"
+#include "SecureBuffer.h"
 #include "TimeUtils.h"
 
 enum class LobbyStatus
 {
     PENDING_HANDSHAKE = 0,
     HANDSHAKE_DONE = 1,
-    ANOMALY = 2
+    ANOMALY = 2,
+    CONFIRMATION_PENDING = 3
 };
 
 enum class MessageDirection
@@ -26,25 +28,50 @@ enum class MessageDirection
 struct ChatMessage
 {
     MessageDirection direction;
-    std::string content;
+    // Uses SecureString so that decrypted message text is wiped from RAM on destruction (OPENSSL_cleanse).
+    // Note: In a future security hardening phase, OPENSSL_secure_malloc / mlock should be integrated
+    // to prevent sensitive plaintext in RAM from being swapped to disk by the kernel.
+    SecureString content;
     int64_t fake_timestamp; // UTC epoch seconds + lobby fake timezone offset
     int64_t seq_num = 0;    // Sequence number of this message in the DHT
     bool operator==(const ChatMessage &) const = default;
 };
 
+using MessageLoader = std::function<ChatMessage()>;
+struct HistoryRecord
+{
+    ChatMessage metadata;
+    MessageLoader load;
+    [[nodiscard]] ChatMessage read() const
+    {
+        return load ? load() : metadata;
+    }
+};
 struct LobbyHistoricalData
 {
-    std::vector<ChatMessage> messages;
-
-    LobbyHistoricalData() = default;
-
+    std::vector<HistoryRecord> records;
+    void append(ChatMessage message, MessageLoader loader = {})
+    {
+        if (loader)
+            message.content.clear();
+        records.push_back({std::move(message), std::move(loader)});
+    }
+    [[nodiscard]] std::vector<ChatMessage> materialize() const
+    {
+        std::vector<ChatMessage> result;
+        result.reserve(records.size());
+        for (const auto &record : records)
+            result.push_back(record.read());
+        return result;
+    }
     bool operator==(const LobbyHistoricalData &other) const
     {
-        return messages == other.messages;
+        if (records.size() != other.records.size())
+            return false;
+        return materialize() == other.materialize();
     }
 };
 
-using MessageHistory = LobbyHistoricalData;
 
 struct AckState
 {
@@ -55,15 +82,16 @@ struct AckState
 
     [[nodiscard]] bool acknowledges(std::uint64_t sequence) const
     {
-        if (sequence == 0) return true;
+        if (sequence == 0)
+            return true;
         return (sequence <= through ||
                 std::binary_search(selective.begin(), selective.end(), sequence));
     }
 
     void compress()
     {
-        auto it = std::remove_if(selective.begin(), selective.end(), [this](std::uint64_t s) { return s <= through; });
-        selective.erase(it, selective.end());
+        std::erase_if(selective, [this](std::uint64_t s)
+                      { return s <= through; });
 
         std::sort(selective.begin(), selective.end());
         auto last = std::unique(selective.begin(), selective.end());
@@ -88,20 +116,16 @@ struct LobbyMetadata
     std::size_t read_messages_count = 0;
     bool is_hidden = false;
     std::string anomaly_message = "";
+    std::string handshake_error;
     int64_t last_heartbeat = 0;
     FakeTimezone fake_timezone;
-
-    [[nodiscard]] bool isEmpty() const
-    {
-        return lobby_name.empty();
-    }
 
     [[nodiscard]] bool isPeerConnected() const
     {
         if (last_heartbeat <= 0)
             return false;
         int64_t currentFakeTime = TimeUtils::computeFakeTimestamp(fake_timezone.offset_seconds);
-        return (currentFakeTime - last_heartbeat) <= 300; // 300s = 5 minutes timeout
+        return (currentFakeTime - last_heartbeat) <= TimeUtils::HEARTBEAT_TIMEOUT_SECONDS;
     }
 
     bool operator==(const LobbyMetadata &) const = default;
@@ -115,22 +139,15 @@ struct LobbyCryptoVault
     SecureString private_node_discussion; // Target root for DHT messages, RAII auto-cleansed
 
     LobbyCryptoVault() = default;
-    LobbyCryptoVault(const LobbyCryptoVault &) = default;
-    LobbyCryptoVault &operator=(const LobbyCryptoVault &) = default;
+    LobbyCryptoVault(const LobbyCryptoVault &) = delete;
+    LobbyCryptoVault &operator=(const LobbyCryptoVault &) = delete;
     LobbyCryptoVault(LobbyCryptoVault &&) noexcept = default;
     LobbyCryptoVault &operator=(LobbyCryptoVault &&) noexcept = default;
     ~LobbyCryptoVault() = default;
 
-    void secureCleanse()
-    {
-        my_x25519_priv.cleanse();
-        private_node_discussion.cleanse();
-    }
-
     bool operator==(const LobbyCryptoVault &) const = default;
 };
 
-using LobbyCryptoState = LobbyCryptoVault;
 
 struct LobbySyncState
 {
@@ -144,112 +161,39 @@ struct LobbySyncState
     bool operator==(const LobbySyncState &) const = default;
 };
 
-using LobbyNetworkState = LobbySyncState;
+
+struct LobbyViewData
+{
+    LobbyMetadata metadata;
+    LobbySyncState sync;
+};
 
 struct LobbyData
 {
     LobbyMetadata metadata;
     LobbySyncState sync;
-    LobbyCryptoVault crypto;
-    MessageHistory history;
-
-    // Direct convenience references to composed fields for legacy and contract compatibility
-    std::string &lobby_name{metadata.lobby_name};
-    std::string &my_pseudo{metadata.my_pseudo};
-    std::string &other_pseudo{metadata.other_pseudo};
-    LobbyStatus &status{metadata.status};
-    std::size_t &read_messages_count{metadata.read_messages_count};
-    bool &is_hidden{metadata.is_hidden};
-    std::string &anomaly_message{metadata.anomaly_message};
-    int64_t &last_heartbeat{metadata.last_heartbeat};
-    FakeTimezone &fake_timezone{metadata.fake_timezone};
-
-    std::string &my_x25519_pub{crypto.my_x25519_pub};
-    SecureString &my_x25519_priv{crypto.my_x25519_priv};
-    std::string &announced_x25519_pub{crypto.announced_x25519_pub};
-    SecureString &private_node_discussion{crypto.private_node_discussion};
-
-    std::int64_t &my_seq_num{sync.my_seq_num};
-    std::int64_t &announced_seq_num{sync.announced_seq_num};
-    AckState &dht_acked_seq_nums{sync.dht_acked_seq_nums};
-    AckState &peer_acked_seq_nums{sync.peer_acked_seq_nums};
-    AckState &downloaded_seq_nums{sync.downloaded_seq_nums};
-    std::vector<std::int64_t> &resynced_seq_nums{sync.resynced_seq_nums};
+    std::shared_ptr<const LobbyCryptoVault> crypto{std::make_shared<LobbyCryptoVault>()};
+    LobbyHistoricalData history;
 
     LobbyData() = default;
+    LobbyData(LobbyMetadata meta, LobbySyncState s, std::shared_ptr<const LobbyCryptoVault> c, LobbyHistoricalData h = {})
+        : metadata(std::move(meta)), sync(std::move(s)), crypto(std::move(c)), history(std::move(h)) {}
 
-    LobbyData(const LobbyData &other)
-        : metadata(other.metadata), sync(other.sync), crypto(other.crypto), history(other.history)
+    [[nodiscard]] bool isPeerConnected() const noexcept
     {
+        return metadata.isPeerConnected();
     }
-
-    LobbyData(LobbyData &&other) noexcept
-        : metadata(std::move(other.metadata)), sync(std::move(other.sync)),
-          crypto(std::move(other.crypto)), history(std::move(other.history))
-    {
-    }
-
-    LobbyData &operator=(const LobbyData &other)
-    {
-        if (this != &other)
-        {
-            metadata = other.metadata;
-            sync = other.sync;
-            crypto = other.crypto;
-            history = other.history;
-        }
-        return *this;
-    }
-
-    LobbyData &operator=(LobbyData &&other) noexcept
-    {
-        if (this != &other)
-        {
-            metadata = std::move(other.metadata);
-            sync = std::move(other.sync);
-            crypto = std::move(other.crypto);
-            history = std::move(other.history);
-        }
-        return *this;
-    }
-
-    ~LobbyData() = default;
-
-    [[nodiscard]] bool isHandshakeDone() const noexcept { return metadata.status == LobbyStatus::HANDSHAKE_DONE; }
-    [[nodiscard]] bool isAnomaly() const noexcept { return metadata.status == LobbyStatus::ANOMALY; }
-    [[nodiscard]] bool isPendingHandshake() const noexcept { return metadata.status == LobbyStatus::PENDING_HANDSHAKE; }
-    [[nodiscard]] bool isPeerConnected() const noexcept { return metadata.isPeerConnected(); }
-    [[nodiscard]] bool isEmpty() const noexcept { return metadata.isEmpty(); }
-
-    [[nodiscard]] const LobbyMetadata &getMetadata() const noexcept { return metadata; }
-    [[nodiscard]] LobbyMetadata &getMetadata() noexcept { return metadata; }
-
-    [[nodiscard]] const LobbySyncState &getSyncState() const noexcept { return sync; }
-    [[nodiscard]] LobbySyncState &getSyncState() noexcept { return sync; }
-    [[nodiscard]] const LobbyNetworkState &getNetworkState() const noexcept { return sync; }
-    [[nodiscard]] LobbyNetworkState &getNetworkState() noexcept { return sync; }
-
-    [[nodiscard]] const LobbyCryptoVault &getCryptoVault() const noexcept { return crypto; }
-    [[nodiscard]] LobbyCryptoVault &getCryptoVault() noexcept { return crypto; }
-    [[nodiscard]] const LobbyCryptoState &getCryptoState() const noexcept { return crypto; }
-    [[nodiscard]] LobbyCryptoState &getCryptoState() noexcept { return crypto; }
-
-    [[nodiscard]] const MessageHistory &getHistory() const noexcept { return history; }
-    [[nodiscard]] MessageHistory &getHistory() noexcept { return history; }
-
     [[nodiscard]] LobbyData cloneWithoutHistory() const
     {
-        LobbyData copy;
-        copy.metadata = metadata;
-        copy.sync = sync;
-        copy.crypto = crypto;
-        return copy;
+        return LobbyData{metadata, sync, crypto, {}};
     }
 
     bool operator==(const LobbyData &other) const
     {
+        const bool cryptoEqual = (!crypto && !other.crypto) ||
+                                 (crypto && other.crypto && *crypto == *other.crypto);
         return metadata == other.metadata && sync == other.sync &&
-               crypto == other.crypto && history == other.history;
+               cryptoEqual && history == other.history;
     }
 };
 
@@ -258,4 +202,6 @@ struct PeerInfo
     std::string pseudo;
     std::string x25519_pub;
     FakeTimezone fake_timezone;
+    std::string confirmed_peer;
+    int protocol_version{2};
 };

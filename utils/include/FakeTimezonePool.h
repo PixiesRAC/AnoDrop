@@ -1,7 +1,9 @@
 #pragma once
 
 
+#include <array>
 #include <random>
+#include <string>
 
 struct FakeTimezone
 {
@@ -16,7 +18,7 @@ namespace FakeTimezonePool
 
 // All offsets are real UTC-based offsets, even for fictional locations.
 // The fictional names just add plausible deniability and fun.
-inline const std::vector<FakeTimezone> POOL = {
+inline const std::array<FakeTimezone, 30> POOL = {{
     // Real timezones
     {"Europe/Paris (UTC+1)", 3600},
     {"America/New_York (UTC-5)", -18000},
@@ -49,7 +51,7 @@ inline const std::vector<FakeTimezone> POOL = {
     {"Gallifrey/Citadelle (UTC+8)", 28800},
     {"Coruscant/Secteur_Senat (UTC+0)", 0},
     {"Zelda/Chateau_Hyrule (UTC-6)", -21600},
-};
+}};
 
 [[nodiscard]] inline FakeTimezone pickRandom()
 {

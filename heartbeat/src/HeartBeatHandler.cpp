@@ -1,11 +1,10 @@
+#include "LogEvents.h"
 #include "HeartbeatHandler.h"
 
-#include <libtorrent/alert_types.hpp>
-#include <nlohmann/json.hpp>
+#include <charconv>
 #include <spdlog/spdlog.h>
 
-#include "DhtSignalingService.h"
-#include "LobbyDataSerializer.h"
+#include "SecureBuffer.h"
 #include "TimeUtils.h"
 
 HeartbeatHandler::HeartbeatHandler(std::shared_ptr<DhtPublisher> dhtPublisher) : m_dhtPublisher(std::move(dhtPublisher))
@@ -14,63 +13,59 @@ HeartbeatHandler::HeartbeatHandler(std::shared_ptr<DhtPublisher> dhtPublisher) :
 
 void HeartbeatHandler::dispatchHeartbeatMessage(const LobbyData &lobbyData)
 {
-    if (!m_dhtPublisher || !m_dhtPublisher->getDhtManager())
+    if (!m_dhtPublisher || !m_dhtPublisher->getDhtManager() || !lobbyData.crypto || lobbyData.crypto->private_node_discussion.empty())
     {
         return;
     }
 
-    int offset = lobbyData.fake_timezone.offset_seconds;
-    std::string lobby = lobbyData.lobby_name;
-    std::string key = lobbyData.private_node_discussion + lobbyData.my_x25519_pub + HEARTBEAT_KEY;
+    int offset = lobbyData.metadata.fake_timezone.offset_seconds;
+    std::string lobby = lobbyData.metadata.lobby_name;
+    SecureString key(lobbyData.crypto->private_node_discussion + lobbyData.crypto->my_x25519_pub + HEARTBEAT_KEY);
 
-    m_dhtPublisher->enqueueNetworkTask(lobby, [pub = m_dhtPublisher, offset, lobby, key]()
-                                       { if (pub) DhtSignalingService::dropHeartbeatMessage(pub.get(), offset, lobby, key); });
+    m_dhtPublisher->enqueueNetworkTask(lobby, [pub = m_dhtPublisher, offset, lobby, key = std::move(key)]()
+                                       {
+        if (pub && pub->getDhtManager())
+            pub->getDhtManager()->publishHeartbeat(offset, lobby, key); });
 }
 
-void HeartbeatHandler::checkLobbyHeartbeat(const LobbyData &lobbyData, std::shared_ptr<LobbyStore> lobbyStore)
+bool HeartbeatHandler::checkLobbyHeartbeat(const LobbyData &lobbyData, std::shared_ptr<LobbyStore> lobbyStore)
 {
-    if (!m_dhtPublisher || !m_dhtPublisher->getDhtManager() || !lobbyStore)
-        return;
+    if (!m_dhtPublisher || !m_dhtPublisher->getDhtManager() || !lobbyStore || !lobbyData.crypto || lobbyData.crypto->private_node_discussion.empty())
+        return false;
 
-    std::string lobbyName = lobbyData.lobby_name;
-    std::string peerHeartbeatKey = lobbyData.private_node_discussion + lobbyData.announced_x25519_pub + HEARTBEAT_KEY;
-    int offset = lobbyData.fake_timezone.offset_seconds;
+    std::string lobbyName = lobbyData.metadata.lobby_name;
+    std::string peerHeartbeatKey = lobbyData.crypto->private_node_discussion + lobbyData.crypto->announced_x25519_pub + HEARTBEAT_KEY;
+    ScopedCleanse keyGuard(peerHeartbeatKey);
 
     std::weak_ptr<DhtPublisher> weakPublisher = m_dhtPublisher;
-    auto callback = [lobbyName, lobbyStore, offset, weakPublisher](const lt::dht_mutable_item_alert *get_mut)
+    auto callback = [lobbyName, lobbyStore, weakPublisher](DhtFetchResult result)
     {
-        std::string valueStr;
-        if (get_mut->item.type() == lt::entry::string_t)
-            valueStr = get_mut->item.string();
-        else
-            valueStr = get_mut->item.to_string();
+        if (result.status == DhtFetchStatus::Timeout || result.status == DhtFetchStatus::Cancelled)
+            return;
+        if (!result.found() || result.value.empty())
+            return;
+        auto valueStr = std::move(result.value);
 
         if (auto pub = weakPublisher.lock())
         {
-            pub->enqueueNetworkTask(lobbyName, [lobbyName, lobbyStore, offset, valueStr, weakPublisher]()
+            pub->enqueueNetworkTask(lobbyName, [lobbyName, lobbyStore, valueStr = std::move(valueStr), weakPublisher]()
                                     {
                 try
                 {
-                    if (valueStr.empty() || valueStr == "<uninitialized>")
+                    std::int64_t peerTimestamp = 0;
+                    auto [ptr, ec] = std::from_chars(valueStr.data(), valueStr.data() + valueStr.size(), peerTimestamp);
+                    if (ec != std::errc() || ptr != valueStr.data() + valueStr.size())
                     {
-                        // Item not found or empty
-                        return;
+                        throw std::invalid_argument("Malformed heartbeat timestamp");
                     }
-
-                    size_t pos;
-                    int64_t peerTimestamp = std::stoll(valueStr, &pos);
-                    if (pos != valueStr.length())
-                    {
-                        throw std::invalid_argument("Trailing characters in heartbeat");
-                    }
-
-                    int64_t currentFakeTime = TimeUtils::computeFakeTimestamp(offset);
 
                     auto lobbyObs = lobbyStore->getLobby(lobbyName);
-                    if (!lobbyObs) return;
-                    auto currentLobbyData = lobbyObs->getLobbyDataWithoutHistory();
+                    if (!lobbyObs)
+                        return;
+                    const auto metadata = lobbyObs->getMetadata();
+                    const std::int64_t currentFakeTime = TimeUtils::computeFakeTimestamp(metadata.fake_timezone.offset_seconds);
 
-                    auto valResult = TimeUtils::validatePeerTimestamp(peerTimestamp, currentFakeTime, currentLobbyData.last_heartbeat);
+                    auto valResult = TimeUtils::validatePeerTimestamp(peerTimestamp, currentFakeTime, metadata.last_heartbeat);
                     if (valResult == TimestampValidationResult::NonMonotonic)
                     {
                         // Same or older heartbeat already processed from DHT, ignore silently
@@ -79,34 +74,34 @@ void HeartbeatHandler::checkLobbyHeartbeat(const LobbyData &lobbyData, std::shar
                     if (valResult != TimestampValidationResult::Valid)
                     {
                         std::string anomalyMsg = "Invalid heartbeat timestamp received from peer";
-                        SPDLOG_WARN("Lobby {}: Invalid heartbeat timestamp ({}) received (result: {}). Setting to ANOMALY.",
-                                    lobbyName, peerTimestamp, static_cast<int>(valResult));
+                        SPDLOG_WARN("[PRESENCE] lobby={} | Invalid heartbeat timestamp ({}) received (result: {}). Setting to ANOMALY.",
+                                    nlohmann::json(lobbyName).dump(), peerTimestamp, static_cast<int>(valResult));
 
+                        lobbyStore->execute(lobbyName, lobby::FlagAnomaly{anomalyMsg});
                         if (auto publisher = weakPublisher.lock())
                         {
-                            DhtSignalingService::signalAndPersistAnomaly(publisher.get(), lobbyName, anomalyMsg, lobbyStore, lobbyObs);
+                            if (auto *mgr = publisher->getDhtManager())
+                                mgr->publishAnomaly(lobbyName, anomalyMsg);
                         }
                         return;
                     }
 
                     if (currentFakeTime - peerTimestamp > HEARTBEAT_TIMEOUT_SEC)
                     {
-                        SPDLOG_WARN("Lobby {}: Peer is disconnected (Heartbeat timeout)", lobbyName);
+                        SPDLOG_WARN("[PRESENCE] lobby={} | Peer is disconnected (Heartbeat timeout)", nlohmann::json(lobbyName).dump());
                     }
                     else
                     {
-                        SPDLOG_INFO("Lobby {}: Received heartbeat, peer is connected", lobbyName);
-                        nlohmann::json patch;
-                        patch["last_heartbeat"] = peerTimestamp;
-                        lobbyStore->asyncUpdateLobbyData(lobbyName, patch);
+                        SPDLOG_INFO("[PRESENCE] lobby={} | Received heartbeat, peer is connected", nlohmann::json(lobbyName).dump());
+                        lobbyStore->execute(lobbyName, lobby::RecordHeartbeat{peerTimestamp});
                     }
                 }
                 catch (const std::exception &e)
                 {
-                    SPDLOG_ERROR("Lobby {}: Failed to parse heartbeat value: '{}'. Exception: {}", lobbyName, valueStr, e.what());
+                    SPDLOG_ERROR("[PRESENCE] lobby={} | Invalid heartbeat rejected", nlohmann::json(lobbyName).dump());
                 } });
         }
     };
 
-    m_dhtPublisher->getDhtManager()->fetchDhtItem(peerHeartbeatKey, lobbyName, callback, false, -1);
+    return m_dhtPublisher->getDhtManager()->fetchDhtItem(peerHeartbeatKey, lobbyName, callback, {DhtFetchKind::Signaling, -1, "heartbeat"});
 }

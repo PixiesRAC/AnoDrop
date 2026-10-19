@@ -118,6 +118,14 @@ void ChatView::show()
 {
     bool inChat = true;
     bool needsRedraw = true;
+
+    struct TimeoutGuard
+    {
+        ~TimeoutGuard()
+        {
+            wtimeout(stdscr, -1);
+        }
+    } timeoutGuard;
     wtimeout(stdscr, 200);
 
     while (inChat)
@@ -128,8 +136,8 @@ void ChatView::show()
             break;
         }
 
-        int chatAreaHeight = LINES - 11;
-        int chatAreaTop = 5;
+        int chatAreaHeight = std::max(1, LINES - 11);
+        int chatAreaTop = std::min(5, LINES > 11 ? 5 : 1);
         m_viewModel->setDimensions(chatAreaHeight, COLS);
 
         if (m_viewModel->update())

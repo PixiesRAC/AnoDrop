@@ -1,6 +1,7 @@
 #pragma once
-
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -12,16 +13,17 @@ class DhtManager;
 class LobbyObserver;
 class LobbyStore;
 
-class NetworkResyncHandler
+class NetworkResyncHandler : public std::enable_shared_from_this<NetworkResyncHandler>
 {
   public:
     struct RetryTracker
     {
         std::chrono::steady_clock::time_point lastAttempt{};
         int attemptCount{0};
+        std::uint64_t reservation{0};
     };
 
-    explicit NetworkResyncHandler(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore = nullptr);
+    explicit NetworkResyncHandler(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore);
     ~NetworkResyncHandler();
 
     void attach(DhtManager *dhtManager);
@@ -38,9 +40,9 @@ class NetworkResyncHandler
     std::shared_ptr<LobbyStore> m_lobbyStore;
 
     std::mutex m_retryMutex;
-    mutable std::shared_mutex m_callbackMutex;
+    std::uint64_t m_nextReservation{0};
+    std::unordered_map<std::string, std::int64_t> m_outboxCursor;
     std::unordered_map<std::string, std::unordered_map<std::int64_t, RetryTracker>> m_outboxRetryAttempts;
-    DhtManager *m_attachedDhtManager{nullptr};
-    std::weak_ptr<std::atomic<bool>> m_dhtManagerAlive;
-    std::shared_ptr<std::atomic<bool>> m_alive{std::make_shared<std::atomic<bool>>(true)};
+    std::atomic<std::uint64_t> m_callbackGeneration{0};
+    std::atomic<bool> m_alive{true};
 };

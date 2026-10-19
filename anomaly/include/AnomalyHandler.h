@@ -12,7 +12,7 @@ class AnomalyHandler
     ~AnomalyHandler() = default;
 
     void dispatchAnomalyMessage(const std::string &lobbyName, const std::string &message);
-    void checkLobbyAnomaly(const std::string &lobbyName, std::shared_ptr<LobbyStore> lobbyStore);
+    bool checkLobbyAnomaly(const std::string &lobbyName, std::shared_ptr<LobbyStore> lobbyStore);
 
   private:
     std::shared_ptr<DhtPublisher> m_dhtPublisher;

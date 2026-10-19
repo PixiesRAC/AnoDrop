@@ -1,10 +1,8 @@
 #include "NetworkUtils.h"
 
-#include <algorithm>
-#include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
-#include <spdlog/spdlog.h>
+#include <sys/socket.h>
 
 namespace NetworkUtils
 {

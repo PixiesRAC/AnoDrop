@@ -1,17 +1,18 @@
 #pragma once
 
 #include "DhtPublisher.h"
+#include "TimeUtils.h"
 
 class HeartbeatHandler
 {
   public:
-    static constexpr int HEARTBEAT_TIMEOUT_SEC = 300; // Renamed from MAX_HEARTBEAT_DISCONNECTION
+    static constexpr int HEARTBEAT_TIMEOUT_SEC = static_cast<int>(TimeUtils::HEARTBEAT_TIMEOUT_SECONDS);
 
     HeartbeatHandler(std::shared_ptr<DhtPublisher> dhtPublisher);
     ~HeartbeatHandler() = default;
 
     void dispatchHeartbeatMessage(const LobbyData &lobbyData);
-    void checkLobbyHeartbeat(const LobbyData &lobbyData, std::shared_ptr<LobbyStore> lobbyStore);
+    bool checkLobbyHeartbeat(const LobbyData &lobbyData, std::shared_ptr<LobbyStore> lobbyStore);
 
   private:
     std::shared_ptr<DhtPublisher> m_dhtPublisher;

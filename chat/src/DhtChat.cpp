@@ -1,161 +1,111 @@
-#include <nlohmann/json.hpp>
-#include "LobbyDataSerializer.h"
+#include "LogEvents.h"
 #include "DhtChat.h"
 
 #include <spdlog/spdlog.h>
 
-
 #include "DhtChatUtils.h"
-#include "DhtPublisher.h"
+#include "DhtMessageCodec.h"
+#include "LobbyStore.h"
 
-DhtChat::DhtChat(Lobby &lobby, std::shared_ptr<DhtPublisher> pub) : m_lobby(lobby), m_publisher(pub)
+DhtChat::DhtChat(std::shared_ptr<LobbyObserver> lobby, std::shared_ptr<OutgoingMessageQueue> publisher,
+                 std::shared_ptr<LobbyStore> store)
+    : m_lobby(std::move(lobby)), m_publisher(std::move(publisher)), m_store(std::move(store))
 {
-    SPDLOG_INFO("DhtChat: Creating chat for lobby {}", m_lobby.getLobbyName());
-    republishUnackedMessages();
+    if (!m_lobby || !m_publisher || !m_store)
+        throw std::invalid_argument("DhtChat requires a lobby, publisher and store");
 }
 
-DhtChat::~DhtChat()
+std::expected<std::int64_t, SendError> DhtChat::sendMessage(const std::string &message)
 {
-}
-
-void DhtChat::republishUnackedMessages()
-{
-    LobbyData data = m_lobby.getLobbyDataWithoutHistory();
-    std::vector<ChatMessage> unackedOutMessages;
-
-    m_lobby.withHistory([&](std::span<const ChatMessage> messages) {
-        for (auto it = messages.rbegin(); it != messages.rend(); ++it)
-        {
-            const auto& msg = *it;
-            if (msg.direction == MessageDirection::OUT)
-            {
-                if (msg.seq_num > 0 && static_cast<std::uint64_t>(msg.seq_num) <= data.peer_acked_seq_nums.through)
-                {
-                    break; // Everything older is mathematically guaranteed to be acknowledged!
-                }
-
-                if (!data.peer_acked_seq_nums.acknowledges(static_cast<std::uint64_t>(msg.seq_num)))
-                {
-                    unackedOutMessages.push_back(msg);
-                }
-            }
-        }
-    });
-
-    for (const auto &msg : unackedOutMessages)
+    std::expected<std::int64_t, SendError> result = std::unexpected(SendError::StorageFailed);
+    SPDLOG_INFO("[USER] lobby={} | Send requested", LogEvents::lobbyId(getLobbyName()));
+    ChatPublishParams params;
     {
-        SPDLOG_INFO("Outbox: Republishing unacknowledged message SeqNum {}", msg.seq_num);
-        nlohmann::json msgJson = msg;
-        std::string payloadStr = msgJson.dump();
-
-        ChatPublishParams params;
-        params.encryptedPayload = payloadStr;
-        params.lobbyName = data.lobby_name;
-        params.targetSeqNum = msg.seq_num;
-        params.sequenceTargetKey = data.private_node_discussion + data.my_x25519_pub;
-        params.announcedTargetKey = data.private_node_discussion + data.announced_x25519_pub;
-        params.messageTargetKey = data.private_node_discussion + data.my_x25519_pub + std::to_string(msg.seq_num);
-
-        if (m_publisher)
+        std::unique_lock sendLock(m_sendMutex);
+        const auto now = std::chrono::steady_clock::now();
+        while (!m_recentSends.empty() && now - m_recentSends.front() >= std::chrono::seconds(RATE_LIMIT_WINDOW_SECONDS))
+            m_recentSends.pop_front();
+        if (m_recentSends.size() >= RATE_LIMIT_MAX_MESSAGES) {
+            SPDLOG_WARN("[MSG-OUT] lobby={} | Send rejected: rate limit", LogEvents::lobbyId(getLobbyName()));
+            return std::unexpected(SendError::RateLimited);
+        }
+        bool committed = false;
+        // Reserve before persistence so allocation failure cannot disguise a committed send.
+        m_recentSends.push_back(now);
+        struct Reservation
+        {
+            std::deque<std::chrono::steady_clock::time_point> &sends;
+            bool &committed;
+            ~Reservation()
+            {
+                if (!committed)
+                    sends.pop_back();
+            }
+        } reservation{m_recentSends, committed};
+        try
+        {
+            m_store->transact(getLobbyName(), [&](const LobbyData &state)
+                              {
+            LobbyUpdate update;
+            if (state.sync.my_seq_num == INT64_MAX) {
+                result = std::unexpected(SendError::SequenceExhausted); return update;
+            }
+            if (state.metadata.is_hidden || (state.metadata.status != LobbyStatus::HANDSHAKE_DONE && state.metadata.status != LobbyStatus::ANOMALY)
+                || !state.crypto || state.crypto->private_node_discussion.empty()) {
+                result = std::unexpected(SendError::Unavailable); return update;
+            }
+            ChatMessage msg{MessageDirection::OUT, message,
+                TimeUtils::computeFakeTimestamp(state.metadata.fake_timezone.offset_seconds), state.sync.my_seq_num + 1};
+            const auto payload = nlohmann::json(msg).dump();
+            if (!network::DhtMessageCodec::fitsBep44(payload)) {
+                result = std::unexpected(SendError::TooLarge); return update;
+            }
+            params.payload = payload;
+            params.lobbyName = state.metadata.lobby_name;
+            params.targetSeqNum = msg.seq_num;
+            params.sequenceTargetKey = state.crypto->private_node_discussion + state.crypto->my_x25519_pub;
+            params.messageTargetKey = params.sequenceTargetKey + std::to_string(msg.seq_num);
+            update = lobby::prepare(state, lobby::StoreOutgoingMessage{msg});
+            result = msg.seq_num;
+            return update; });
+        }
+        catch (const StoreRecoveryRequired &)
+        {
+            return std::unexpected(SendError::RecoveryRequired);
+        }
+        catch (const std::exception &e)
+        {
+            SPDLOG_ERROR("[MSG-OUT] Cannot persist outgoing message: {}", e.what());
+            return std::unexpected(SendError::StorageFailed);
+        }
+        committed = result.has_value();
+    } // Reservation and send mutex are released before calling the queue.
+    if (result)
+    {
+        SPDLOG_DEBUG("[MSG-OUT] lobby={} seq={} | Message queued for publication", LogEvents::lobbyId(getLobbyName()), *result);
+        try
         {
             m_publisher->enqueueChatMessage(params);
         }
-    }
-}
-
-std::int64_t DhtChat::sendMessage(const std::string &message)
-{
-    LobbyData data = m_lobby.getLobbyDataWithoutHistory();
-
-    std::int64_t currentFakeTime = TimeUtils::computeFakeTimestamp(data.fake_timezone.offset_seconds);
-    int recentMessagesCount = 0;
-
-    m_lobby.withHistory([&](std::span<const ChatMessage> messages) {
-        for (auto it = messages.rbegin(); it != messages.rend(); ++it)
+        catch (const std::exception &e)
         {
-            if (it->direction == MessageDirection::OUT)
-            {
-                if (currentFakeTime - it->fake_timestamp <= RATE_LIMIT_WINDOW_SECONDS)
-                {
-                    recentMessagesCount++;
-                }
-                else
-                {
-                    break; // Since our OUT messages are chronologically ordered
-                }
-            }
+            // A committed message is queued, even when the immediate wakeup fails.
+            SPDLOG_WARN("[MSG-OUT] Message remains in durable outbox: {}", e.what());
         }
-    });
-
-    if (recentMessagesCount >= RATE_LIMIT_MAX_MESSAGES)
-    {
-        SPDLOG_WARN("DhtChat: Rate limit exceeded for lobby {}. Max {} messages per {} seconds.", 
-                    data.lobby_name, RATE_LIMIT_MAX_MESSAGES, RATE_LIMIT_WINDOW_SECONDS);
-        return -1;
     }
-
-    SPDLOG_INFO("DhtChat: Sending message to lobby {}: {}", data.lobby_name, message);
-
-    std::int64_t newSeqNum = data.my_seq_num + 1;
-    ChatMessage chatMsg;
-    chatMsg.direction = MessageDirection::OUT;
-    chatMsg.content = message;
-    chatMsg.fake_timestamp = TimeUtils::computeFakeTimestamp(data.fake_timezone.offset_seconds);
-    chatMsg.seq_num = newSeqNum;
-
-    nlohmann::json msgJson = chatMsg;
-    std::string payloadStr = msgJson.dump();
-
-    size_t expectedBencodeSize = std::to_string(payloadStr.size()).length() + 1 + payloadStr.size();
-    if (expectedBencodeSize > DhtManager::MAX_BEP44_PAYLOAD_SIZE)
-    {
-        SPDLOG_WARN("DhtChat: Message too large for BEP 44 ({} bytes). Rejected.", expectedBencodeSize);
-        return -1;
-    }
-
-    ChatPublishParams params;
-    params.encryptedPayload = payloadStr; // Will be encrypted later
-    params.lobbyName = data.lobby_name;
-    params.targetSeqNum = newSeqNum;
-    params.sequenceTargetKey = data.private_node_discussion + data.my_x25519_pub;
-    params.announcedTargetKey = data.private_node_discussion + data.announced_x25519_pub;
-    params.messageTargetKey = data.private_node_discussion + data.my_x25519_pub + std::to_string(newSeqNum);
-
-    if (m_publisher)
-    {
-        nlohmann::json patch;
-        patch["new_message"] = chatMsg;
-        patch["my_seq_num"] = newSeqNum;
-
-        dispatchPatch(patch);
-
-        SPDLOG_INFO("DhtChat: Message persisted to history for lobby {}", data.lobby_name);
-
-        SPDLOG_DEBUG("🚀 [NETWORK SEND] Network Worker: Enqueueing DHT publish task for message '{}' (SeqNum: {})", chatMsg.content, newSeqNum);
-        m_publisher->enqueueChatMessage(params);
-    }
-    else
-    {
-        SPDLOG_ERROR("DhtChat::sendMessage failed: Publisher is null");
-    }
-
-    return newSeqNum;
+    if (!result) SPDLOG_WARN("[MSG-OUT] lobby={} reason_code={} | Send rejected", LogEvents::lobbyId(getLobbyName()), static_cast<int>(result.error()));
+    return result;
 }
 
-void DhtChat::dispatchPatch(const nlohmann::json &patch)
+void DhtChat::markRead(std::size_t count)
 {
-    nlohmann::json mutablePatch = patch;
-    if (m_publisher && m_publisher->getDhtManager() && m_publisher->getDhtManager()->getLobbyStore())
-    {
-        m_publisher->getDhtManager()->getLobbyStore()->asyncUpdateLobbyData(m_lobby.getLobbyName(), mutablePatch);
-    }
-    else
-    {
-        m_lobby.onUpdate(mutablePatch);
-    }
+    m_store->execute(getLobbyName(), lobby::MarkRead{count});
 }
-
+void DhtChat::markResynced(std::vector<std::int64_t> sequences)
+{
+    m_store->execute(getLobbyName(), lobby::MarkResynced{std::move(sequences)});
+}
 std::string DhtChat::getLobbyName() const
 {
-    return m_lobby.getLobbyName();
+    return m_lobby->getLobbyName();
 }

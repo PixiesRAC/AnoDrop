@@ -1,6 +1,10 @@
-#include <nlohmann/json.hpp>
-#include "LobbyDataSerializer.h"
 #include "ChatResyncer.h"
+#include "LogEvents.h"
+#include <spdlog/spdlog.h>
+
+#include <ctime>
+#include <format>
+
 #include "ChatConstants.h"
 
 namespace chat
@@ -8,29 +12,9 @@ namespace chat
 
 int ChatResyncer::resyncPendingMessages(LobbyObserver &lobbyObserver, DhtChat &dhtChat)
 {
-    LobbyData data = lobbyObserver.getLobbyDataWithoutHistory();
-
-    std::vector<ChatMessage> toResend;
-
-    lobbyObserver.withHistory([&](std::span<const ChatMessage> messages) {
-        for (const auto &msg : messages)
-        {
-            if (msg.direction == MessageDirection::OUT)
-            {
-                bool isAcked = data.peer_acked_seq_nums.acknowledges(msg.seq_num);
-
-                bool isResynced = std::binary_search(
-                    data.resynced_seq_nums.begin(),
-                    data.resynced_seq_nums.end(),
-                    msg.seq_num);
-
-                if (!isAcked && !isResynced)
-                {
-                    toResend.push_back(msg);
-                }
-            }
-        }
-    });
+    // Explicit resync keeps its existing wire format; only selection is shared with the outbox.
+    SPDLOG_INFO("[USER] lobby={} | Manual resync requested", LogEvents::lobbyId(lobbyObserver.getLobbyName()));
+    auto toResend = lobbyObserver.pendingOutgoing(0, DhtChat::RATE_LIMIT_MAX_MESSAGES);
 
     std::vector<std::int64_t> resyncedOriginals;
 
@@ -39,18 +23,18 @@ int ChatResyncer::resyncPendingMessages(LobbyObserver &lobbyObserver, DhtChat &d
     {
         std::time_t t = msg.fake_timestamp;
         std::tm tm_info{};
-        localtime_r(&t, &tm_info);
+        gmtime_r(&t, &tm_info);
 
-        std::ostringstream timeStream;
-        timeStream << std::put_time(&tm_info, "%H:%M:%S");
+        char timeBuf[16]{};
+        std::strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &tm_info);
 
         // TODO (Protocol Debt): Prefixing resync metadata directly into plaintext content alters user payload
         // and could collide with genuine user messages.
         // Target architecture: Move retransmission metadata to an explicit wire protocol envelope / header field
         // (e.g., `retransmit_seq_num` in the DHT payload) rather than mutating the user message text.
-        std::string newContent = std::string(chat::RESYNC_PREFIX) + std::to_string(msg.seq_num) + " " + timeStream.str() + "] " + msg.content;
-        std::int64_t newSeq = dhtChat.sendMessage(newContent);
-        if (newSeq != -1)
+        std::string newContent = std::format("{}{} {}] {}", chat::RESYNC_PREFIX, msg.seq_num, timeBuf, msg.content);
+        auto newSeq = dhtChat.sendMessage(newContent);
+        if (newSeq)
         {
             resyncedOriginals.push_back(msg.seq_num);
         }
@@ -62,11 +46,10 @@ int ChatResyncer::resyncPendingMessages(LobbyObserver &lobbyObserver, DhtChat &d
 
     if (!resyncedOriginals.empty())
     {
-        nlohmann::json patch;
-        patch["message_resynced"] = resyncedOriginals;
-        dhtChat.dispatchPatch(patch);
+        dhtChat.markResynced(std::move(resyncedOriginals));
     }
     
+    SPDLOG_INFO("[RESYNC] lobby={} resent={} skipped={} | Manual resync completed", LogEvents::lobbyId(lobbyObserver.getLobbyName()), toResend.size() - skippedCount, skippedCount);
     return skippedCount;
 }
 

@@ -6,6 +6,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -20,7 +21,8 @@
 class PartitionedThreadPool
 {
   public:
-    explicit PartitionedThreadPool(size_t numThreads);
+    using ThreadLauncher = std::function<std::thread(std::function<void()>)>;
+    explicit PartitionedThreadPool(size_t numThreads, ThreadLauncher launch = {});
     ~PartitionedThreadPool();
 
     PartitionedThreadPool(const PartitionedThreadPool &) = delete;
@@ -33,6 +35,10 @@ class PartitionedThreadPool
     /// to handle cases where the task couldn't be queued (e.g. during shutdown).
     [[nodiscard]] bool enqueue(const std::string &partitionKey, std::function<void()> task);
 
+    void post(const std::string& key, std::function<void()> task) {
+        if (!enqueue(key, std::move(task))) throw std::runtime_error("Network queue is closed or full");
+    }
+
     /// Close the pool, cancel pending tasks and join the workers.
     void shutdown();
 
@@ -44,6 +50,8 @@ class PartitionedThreadPool
         std::condition_variable queueCv;
         bool closed = false;
     };
+
+    inline static thread_local WorkerState* s_currentWorker = nullptr;
 
     // Workers own a reference to their state so that a worker which must be
     // detached (shutdown triggered from one of its own tasks) never touches freed memory.

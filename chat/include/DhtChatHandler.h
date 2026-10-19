@@ -1,25 +1,18 @@
 #pragma once
+#include <unordered_map>
 
 #include "DhtChat.h"
-
-class DhtPublisher;
-class LobbyStore;
-
 class DhtChatHandler
 {
   public:
-    DhtChatHandler();
-    ~DhtChatHandler();
-
-    void setDhtPublisher(std::shared_ptr<DhtPublisher> pub);
-
-    void addChat(Lobby &lobby);
-    [[nodiscard]] DhtChat *getChat(size_t index);
-    [[nodiscard]] DhtChat *getChatForLobby(Lobby &lobby);
-    [[nodiscard]] size_t getChatCount() const;
-    void clearChats();
+    DhtChatHandler(std::shared_ptr<OutgoingMessageQueue> publisher, std::shared_ptr<LobbyStore> store)
+        : m_publisher(std::move(publisher)), m_store(std::move(store))
+    {
+    }
+    DhtChat *getChatForLobby(std::shared_ptr<LobbyObserver> lobby);
 
   private:
-    std::vector<std::unique_ptr<DhtChat>> dht_chats;
-    std::shared_ptr<DhtPublisher> m_dhtPublisher;
+    std::shared_ptr<OutgoingMessageQueue> m_publisher;
+    std::shared_ptr<LobbyStore> m_store;
+    std::unordered_map<std::string, std::unique_ptr<DhtChat>> m_chats;
 };

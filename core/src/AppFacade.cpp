@@ -1,43 +1,33 @@
-#include <nlohmann/json.hpp>
-#include "LobbyDataSerializer.h"
+#include "LogEvents.h"
 #include "AppFacade.h"
 
 #include <spdlog/spdlog.h>
 
 #include "AnomalyHandler.h"
-#include "NetworkResyncHandler.h"
 #include "DhtChatHandler.h"
+#include "NetworkResyncHandler.h"
 
 constexpr auto POLLING_TIMEOUT = std::chrono::milliseconds(5000);
-constexpr auto MAX_TIMEOUT_COUNT = 3;
 
 AppFacade::AppFacade(std::shared_ptr<DhtPublisher> dhtPublisher, std::shared_ptr<LobbyStore> lobbyStore, bool autoPullMessages) : m_dhtPublisher(std::move(dhtPublisher)), m_lobbyStore(std::move(lobbyStore)), m_autoPullMessages(autoPullMessages)
 {
-    m_chatHandler = std::make_unique<DhtChatHandler>();
-    if (m_dhtPublisher)
-    {
-        m_chatHandler->setDhtPublisher(m_dhtPublisher);
-    }
-    m_networkResyncer = std::make_unique<NetworkResyncHandler>(m_dhtPublisher, m_lobbyStore);
-    if (m_dhtPublisher && m_dhtPublisher->getDhtManager())
-    {
-        m_networkResyncer->attach(m_dhtPublisher->getDhtManager());
-    }
-    m_syncThread = std::jthread(&AppFacade::syncThreadLoop, this);
+    if (!m_dhtPublisher || !m_lobbyStore)
+        throw std::invalid_argument("AppFacade requires publisher and store");
+    m_chatHandler = std::make_unique<DhtChatHandler>(m_dhtPublisher, m_lobbyStore);
+    m_networkResyncer = std::make_shared<NetworkResyncHandler>(m_dhtPublisher, m_lobbyStore);
+    m_networkResyncer->attach(m_dhtPublisher->getDhtManager());
+    m_syncThread = std::jthread([this](std::stop_token stoken) { syncThreadLoop(stoken); }, m_stopSource.get_token());
 }
 
 void AppFacade::shutdown()
 {
-    m_syncThread.request_stop();
-    m_syncCv.notify_all();
+    m_ownerThread.requireOwner();
+    requestStop();
     if (m_syncThread.joinable())
     {
         m_syncThread.join();
     }
-    if (m_networkResyncer)
-    {
-        m_networkResyncer->detach();
-    }
+    m_networkResyncer->detach();
 }
 
 AppFacade::~AppFacade()
@@ -47,23 +37,19 @@ AppFacade::~AppFacade()
 
 std::vector<std::shared_ptr<LobbyObserver>> AppFacade::getLobbies() const
 {
-    return m_lobbyStore ? m_lobbyStore->getLobbies() : std::vector<std::shared_ptr<LobbyObserver>>{};
+    return m_lobbyStore->getLobbies();
 }
 
 void AppFacade::updateMasterPassword(const std::string &newPassword)
 {
-    if (m_lobbyStore)
-    {
-        m_lobbyStore->updateMasterPassword(newPassword);
-    }
+    SPDLOG_INFO("[USER] Password rotation requested");
+    m_lobbyStore->updateMasterPassword(newPassword);
 }
 
 void AppFacade::flagAnomaly(const std::string &lobbyName, const std::string &message)
 {
-    nlohmann::json patch;
-    patch["status"] = LobbyStatus::ANOMALY;
-    patch["anomaly_message"] = message;
-    m_lobbyStore->asyncUpdateLobbyData(lobbyName, patch);
+    SPDLOG_INFO("[USER] lobby={} | Anomaly report requested", LogEvents::lobbyId(lobbyName));
+    m_lobbyStore->execute(lobbyName, lobby::FlagAnomaly{message});
 
     AnomalyHandler handler(m_dhtPublisher);
     handler.dispatchAnomalyMessage(lobbyName, message);
@@ -71,24 +57,18 @@ void AppFacade::flagAnomaly(const std::string &lobbyName, const std::string &mes
 
 HandshakeKeyService::ChannelKeys AppFacade::initiateHandshake(const std::string &passphrase, const std::string &pseudo)
 {
-    if (!m_dhtPublisher || !m_lobbyStore)
-    {
-        throw std::runtime_error("Dependencies missing in AppFacade");
-    }
-
     if (m_lobbyStore->getLobby(passphrase) != nullptr)
     {
-        SPDLOG_WARN("Cannot create lobby '{}': Lobby already exists in store.", passphrase);
+        SPDLOG_WARN("[BOOT] Cannot create lobby {}: Lobby already exists in store.", LogEvents::lobbyId(passphrase));
         throw std::runtime_error("Lobby already exists!");
     }
 
+    SPDLOG_INFO("[USER] lobby={} | Lobby creation requested", LogEvents::lobbyId(passphrase));
     HandshakeKeyService::ChannelKeys channelKeys = m_dhtPublisher->deriveChannelKeys(passphrase);
 
-    nlohmann::json patch;
-    patch["status"] = LobbyStatus::PENDING_HANDSHAKE;
-    patch["my_pseudo"] = pseudo;
-    m_lobbyStore->asyncUpdateLobbyData(passphrase, patch);
+    m_lobbyStore->execute(passphrase, lobby::BeginHandshake{pseudo});
 
+    SPDLOG_INFO("[HANDSHAKE] lobby={} target_sha1={} public_key_ed25519={} | Rendezvous prepared", LogEvents::lobbyId(passphrase), channelKeys.targetIDHex, channelKeys.pubKeyHex);
     return channelKeys;
 }
 
@@ -103,11 +83,6 @@ void AppFacade::synchronizeAllActiveLobbies()
 
 void AppFacade::synchronizeAndProcessNewIncomingMessage(std::shared_ptr<LobbyObserver> lobbyObs)
 {
-    if (!m_dhtPublisher || !m_lobbyStore)
-    {
-        throw std::runtime_error("Dependencies missing in AppFacade");
-    }
-
     auto meta = lobbyObs->getMetadata();
     if (meta.is_hidden || (meta.status != LobbyStatus::HANDSHAKE_DONE && meta.status != LobbyStatus::ANOMALY))
     {
@@ -119,96 +94,90 @@ void AppFacade::synchronizeAndProcessNewIncomingMessage(std::shared_ptr<LobbyObs
     if (it == m_activeSyncLobbies.end())
     {
         m_activeSyncLobbies.push_back(lobbyObs);
+        ++m_syncGeneration;
         m_syncCv.notify_one();
     }
 }
 
 void AppFacade::syncThreadLoop(std::stop_token stoken)
 {
-    std::unordered_map<std::string, int> timeoutCounters;
 
     while (!stoken.stop_requested())
     {
-        if (m_autoPullMessages)
+        std::uint64_t generation = 0;
+        try
         {
-            synchronizeAllActiveLobbies();
-        }
-
-        std::vector<std::shared_ptr<LobbyObserver>> lobbiesToSync;
-        {
-            std::lock_guard<std::mutex> lock(m_syncMutex);
-            lobbiesToSync = m_activeSyncLobbies;
-        }
-
-        for (auto &obs : lobbiesToSync)
-        {
-            if (!obs->isFetchingSeq())
+            if (m_autoPullMessages)
             {
-                timeoutCounters[obs->getLobbyName()] = 0;
-                std::string targetKey;
-                obs->withDataView([&targetKey](const LobbyMetadata &, const LobbySyncState &, const LobbyCryptoVault &crypto) {
-                    targetKey = crypto.private_node_discussion + crypto.announced_x25519_pub;
+                synchronizeAllActiveLobbies();
+            }
+
+            std::vector<std::shared_ptr<LobbyObserver>> lobbiesToSync;
+            {
+                std::lock_guard<std::mutex> lock(m_syncMutex);
+                std::erase_if(m_activeSyncLobbies, [](const std::shared_ptr<LobbyObserver> &obs) {
+                    if (!obs) return true;
+                    auto meta = obs->getMetadata();
+                    return meta.is_hidden || (meta.status != LobbyStatus::HANDSHAKE_DONE && meta.status != LobbyStatus::ANOMALY);
                 });
-                if (m_dhtPublisher)
-                {
-                    obs->setFetchingSeq();
-                    m_dhtPublisher->enqueueNetworkTask(obs->getLobbyName(), [pub = m_dhtPublisher, targetKey, obs]()
-                                                       {
-                                                           if (pub)
-                                                               pub->fetchDhtItem(targetKey, obs, true);
-                                                       });
-                }
-            }
-            else
-            {
-                timeoutCounters[obs->getLobbyName()]++;
-                if (timeoutCounters[obs->getLobbyName()] >= MAX_TIMEOUT_COUNT)
-                {
-                    SPDLOG_WARN("DHT Fetch timeout for lobby {}! Unlocking to retry...", obs->getLobbyName());
-                    obs->clearFetchingSeq();
-                    timeoutCounters[obs->getLobbyName()] = 0;
-                }
+                lobbiesToSync = m_activeSyncLobbies;
+                generation = m_syncGeneration;
             }
 
-            if (m_networkResyncer)
+            for (auto &obs : lobbiesToSync)
             {
-                m_networkResyncer->retryUnconfirmedMessages(obs);
+                m_dhtPublisher->enqueuePollingTask(obs->getLobbyName(), "messages",
+                                                   [pub = m_dhtPublisher, obs]
+                                                   { pub->fetchLatestSequence(obs); });
             }
+            // Durable outgoing messages must retry even when automatic incoming polling is disabled.
+            m_networkResyncer->retryAllUnconfirmedMessages();
+        }
+        catch (const std::exception &e)
+        {
+            SPDLOG_ERROR("[BOOT] Polling iteration failed: {}", e.what());
+        }
+        catch (...)
+        {
+            SPDLOG_ERROR("[BOOT] Polling iteration threw a non-standard exception");
         }
         std::unique_lock<std::mutex> cv_lock(m_syncMutex);
-        m_syncCv.wait_for(cv_lock, stoken, POLLING_TIMEOUT, []{ return false; });
+        m_syncCv.wait_for(cv_lock, stoken, POLLING_TIMEOUT, [&]
+                          { return generation != m_syncGeneration; });
     }
 }
 
 void AppFacade::hideLobby(const std::string &lobbyName)
 {
-    if (m_lobbyStore)
-    {
-        nlohmann::json patch = {{"is_hidden", true}};
-        m_lobbyStore->asyncUpdateLobbyData(lobbyName, patch);
-    }
+    SPDLOG_INFO("[USER] lobby={} | Hide requested", LogEvents::lobbyId(lobbyName));
+    m_lobbyStore->execute(lobbyName, lobby::SetVisibility{true});
 
-    std::lock_guard<std::mutex> lock(m_syncMutex);
-    m_activeSyncLobbies.erase(
-        std::remove_if(m_activeSyncLobbies.begin(), m_activeSyncLobbies.end(),
-                       [&](const std::shared_ptr<LobbyObserver> &obs)
-                       {
-                           return obs->getLobbyName() == lobbyName;
-                       }),
-        m_activeSyncLobbies.end());
+    const auto lobby = m_lobbyStore->getLobby(lobbyName);
+    std::lock_guard lock(m_syncMutex);
+    std::erase(m_activeSyncLobbies, lobby);
+    ++m_syncGeneration;
+    m_syncCv.notify_one();
 }
 
 bool AppFacade::unhideLobbyIfExists(const std::string &lobbyName)
 {
-    if (m_lobbyStore)
+    auto lobby = m_lobbyStore->getLobby(lobbyName);
+    if (lobby && lobby->getMetadata().is_hidden)
     {
-        auto lobby = m_lobbyStore->getLobby(lobbyName);
-        if (lobby != nullptr && lobby->getMetadata().is_hidden)
-        {
-            nlohmann::json patch = {{"is_hidden", false}};
-            m_lobbyStore->asyncUpdateLobbyData(lobbyName, patch);
-            return true;
-        }
+        SPDLOG_INFO("[USER] lobby={} | Restore requested", LogEvents::lobbyId(lobbyName));
+        m_lobbyStore->execute(lobbyName, lobby::SetVisibility{false});
+        return true;
     }
     return false;
+}
+
+DhtChat *AppFacade::chatForLobby(std::shared_ptr<LobbyObserver> lobby)
+{
+    return m_chatHandler->getChatForLobby(std::move(lobby));
+}
+
+void AppFacade::requestStop()
+{
+    m_stopSource.request_stop();
+    m_syncCv.notify_all();
 }

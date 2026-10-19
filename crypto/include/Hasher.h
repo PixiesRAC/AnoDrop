@@ -1,12 +1,12 @@
 #pragma once
 
-#include <openssl/evp.h>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
-#include <vector>
-#include <memory>
 #include <unordered_map>
-#include <shared_mutex>
+#include <vector>
 
 #include "Config.h"
 #include "SaltParams.h"
@@ -22,7 +22,7 @@ class Hasher
     Hasher() = default;
     ~Hasher() = default;
 
-    std::unique_ptr<Config> m_config;
+    std::shared_ptr<const Config> m_config;
     mutable std::shared_mutex m_cacheMutex;
     std::unordered_map<std::string, std::vector<unsigned char>> m_saltCache;
 
@@ -38,35 +38,18 @@ class Hasher
 
     void setConfig(const Config &config)
     {
-        std::unique_lock<std::shared_mutex> lock(m_cacheMutex);
-        m_config = std::make_unique<Config>(config);
+        auto replacement = std::make_shared<const Config>(config);
+        std::unique_lock lock(m_cacheMutex);
+        m_config = std::move(replacement);
         m_saltCache.clear();
-    }
-
-    [[nodiscard]] inline std::vector<unsigned char> getHashMsg256(const std::string &rawMsg)
-    {
-        std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(EVP_MD_CTX_new(), &EVP_MD_CTX_free);
-        if (!context)
-        {
-            throw std::runtime_error("Failed to create EVP_MD_CTX");
-        }
-
-        std::vector<unsigned char> hash(static_cast<size_t>(EVP_MD_size(EVP_sha256())));
-        unsigned int lengthOfHash = 0;
-
-        if (EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1 ||
-            EVP_DigestUpdate(context.get(), rawMsg.data(), rawMsg.size()) != 1 ||
-            EVP_DigestFinal_ex(context.get(), hash.data(), &lengthOfHash) != 1)
-        {
-            throw std::runtime_error("SHA-256 digest failed");
-        }
-
-        hash.resize(lengthOfHash);
-        return hash;
     }
 
     [[nodiscard]] inline std::vector<unsigned char> generateArgon2Salt(const std::string &lobbyName)
     {
+        uint32_t iterations = 5;
+        SaltParams params{};
+        std::shared_ptr<const Config> configSnapshot;
+
         {
             std::shared_lock<std::shared_mutex> rLock(m_cacheMutex);
             auto it = m_saltCache.find(lobbyName);
@@ -74,14 +57,8 @@ class Hasher
             {
                 return it->second;
             }
-        }
-
-        uint32_t iterations = 5;
-        SaltParams params{};
-
-        {
-            std::shared_lock<std::shared_mutex> rLock(m_cacheMutex);
-            const Config *cfg = m_config.get();
+            configSnapshot = m_config;
+            const Config *cfg = configSnapshot.get();
             if (cfg)
             {
                 iterations = static_cast<uint32_t>(cfg->getArgon2Iterations());
@@ -106,6 +83,10 @@ class Hasher
 
         {
             std::unique_lock<std::shared_mutex> wLock(m_cacheMutex);
+            if (configSnapshot != m_config)
+                return output;
+            if (m_saltCache.size() >= 256)
+                m_saltCache.erase(m_saltCache.begin());
             m_saltCache[lobbyName] = output;
         }
 

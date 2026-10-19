@@ -1,4 +1,6 @@
 #include "LobbiesView.h"
+#include "LogEvents.h"
+#include <spdlog/spdlog.h>
 
 #include <ncurses.h>
 #undef timeout
@@ -16,38 +18,30 @@ void LobbiesView::show()
     bool inLobbyMenu = true;
     int selectedLobby = 0;
 
+    struct TimeoutGuard
+    {
+        ~TimeoutGuard()
+        {
+            wtimeout(stdscr, -1);
+        }
+    } timeoutGuard;
     wtimeout(stdscr, 200);
 
     while (inLobbyMenu)
     {
         auto allObservers = m_appFacade ? m_appFacade->getLobbies() : std::vector<std::shared_ptr<LobbyObserver>>{};
         std::vector<std::shared_ptr<LobbyObserver>> lobbiesObservers;
+        std::vector<LobbyMetadata> lobbies;
+        lobbiesObservers.reserve(allObservers.size());
+        lobbies.reserve(allObservers.size());
         for (const auto &obs : allObservers)
         {
-            if (!obs->getMetadata().is_hidden)
+            auto meta = obs->getMetadata();
+            if (!meta.is_hidden)
             {
                 lobbiesObservers.push_back(obs);
+                lobbies.push_back(std::move(meta));
             }
-        }
-
-        auto chatHandler = m_appFacade ? m_appFacade->getChatHandler() : nullptr;
-        if (chatHandler && chatHandler->getChatCount() != lobbiesObservers.size())
-        {
-            chatHandler->clearChats();
-            for (const auto &obs : lobbiesObservers)
-            {
-                auto lobbyPtr = std::dynamic_pointer_cast<Lobby>(obs);
-                if (lobbyPtr)
-                {
-                    chatHandler->addChat(*lobbyPtr);
-                }
-            }
-        }
-
-        std::vector<LobbyMetadata> lobbies;
-        for (const auto &obs : lobbiesObservers)
-        {
-            lobbies.push_back(obs->getMetadata());
         }
 
         if (lobbies.empty())
@@ -60,6 +54,11 @@ void LobbiesView::show()
             if (ch == 'q' || ch == 'Q')
                 inLobbyMenu = false;
             continue;
+        }
+
+        if (selectedLobby >= static_cast<int>(lobbies.size()))
+        {
+            selectedLobby = std::max(0, static_cast<int>(lobbies.size()) - 1);
         }
 
         clear();
@@ -78,7 +77,7 @@ void LobbiesView::show()
 
             bool hasUnread = lobbiesObservers[i]->hasUnreadMessages();
 
-            int maxDispLen = COLS > 80 ? COLS - 45 : 35; // Responsive to terminal size
+            int maxDispLen = std::max(10, COLS > 80 ? COLS - 45 : std::min(35, COLS - 20)); // Responsive to terminal size
             if (dispName.length() > (size_t)maxDispLen)
                 dispName = dispName.substr(0, maxDispLen) + "...";
 
@@ -89,8 +88,9 @@ void LobbiesView::show()
             std::string statusStr;
             switch (lobbies[i].status)
             {
+            case LobbyStatus::CONFIRMATION_PENDING:
             case LobbyStatus::PENDING_HANDSHAKE:
-                statusStr = "[PENDING]";
+                statusStr = lobbies[i].handshake_error.empty() ? "[PENDING]" : "[HANDSHAKE ERROR]";
                 colorPair = 2;
                 break;
             case LobbyStatus::HANDSHAKE_DONE:
@@ -181,16 +181,19 @@ void LobbiesView::show()
                 wtimeout(stdscr, -1); // Disable timeout to wait for user input infinitely in chat
                 auto &lobbyObs = lobbiesObservers[static_cast<size_t>(selectedLobby)];
                 m_appFacade->synchronizeAndProcessNewIncomingMessage(lobbyObs);
-                auto lobbyPtr = std::dynamic_pointer_cast<Lobby>(lobbyObs);
-                DhtChat *dhtChat = (chatHandler && lobbyPtr) ? chatHandler->getChatForLobby(*lobbyPtr) : nullptr;
+                DhtChat *dhtChat = m_appFacade->chatForLobby(lobbyObs);
                 ChatView chatView(lobbyObs, dhtChat);
+                SPDLOG_INFO("[USER] lobby={} | Chat opened", LogEvents::lobbyId(lobbyObs->getLobbyName()));
                 chatView.show();
+                SPDLOG_INFO("[USER] lobby={} | Chat closed", LogEvents::lobbyId(lobbyObs->getLobbyName()));
                 wtimeout(stdscr, 200); // Restore timeout
             }
             else
             {
                 attron(COLOR_PAIR(2) | A_BOLD);
-                mvprintw(LINES - 1, 2, "Cannot open: Lobby handshake is still pending with peer.");
+                const auto& error = lobbies[static_cast<size_t>(selectedLobby)].handshake_error;
+                const auto reason = error.empty() ? std::string("Lobby handshake is still pending with peer.") : error;
+                mvprintw(LINES - 1, 2, "Cannot open: %.*s", std::max(0, COLS - 16), reason.c_str());
                 attroff(COLOR_PAIR(2) | A_BOLD);
                 refresh();
             }

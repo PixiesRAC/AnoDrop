@@ -1,0 +1,8 @@
+build/
+compile_commands.json
+config.json
+config2.json
+.vscode/
+.agent/
+*.log
+doc

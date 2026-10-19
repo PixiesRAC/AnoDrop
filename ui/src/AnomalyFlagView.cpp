@@ -1,6 +1,7 @@
 #include "AnomalyFlagView.h"
 
 #include <ncurses.h>
+#include <openssl/crypto.h>
 
 namespace ui
 {
@@ -69,11 +70,23 @@ void AnomalyFlagView::show()
                 clear();
                 mvprintw(2, 4, "=== Manual Anomaly Entry ===");
                 mvprintw(4, 4, "Enter Lobby Name (Passphrase): ");
+                struct CursorGuard
+                {
+                    ~CursorGuard()
+                    {
+                        noecho();
+                        curs_set(0);
+                    }
+                } guard;
                 echo();
-                char buf[256];
-                getnstr(buf, 255);
-                noecho();
-                targetLobby = buf;
+                curs_set(1);
+                char buf[256]{};
+                int rc = getnstr(buf, static_cast<int>(sizeof(buf) - 1));
+                if (rc != ERR)
+                {
+                    targetLobby = buf;
+                }
+                OPENSSL_cleanse(buf, sizeof(buf));
             }
             else
             {
@@ -86,11 +99,24 @@ void AnomalyFlagView::show()
             if (!targetLobby.empty())
             {
                 mvprintw(6, 4, "Enter Anomaly Message (optional): ");
+                struct CursorGuard
+                {
+                    ~CursorGuard()
+                    {
+                        noecho();
+                        curs_set(0);
+                    }
+                } guard;
                 echo();
-                char msgBuf[256];
-                getnstr(msgBuf, 255);
-                noecho();
-                std::string anomalyMsg(msgBuf);
+                curs_set(1);
+                char msgBuf[256]{};
+                int rc = getnstr(msgBuf, static_cast<int>(sizeof(msgBuf) - 1));
+                std::string anomalyMsg;
+                if (rc != ERR)
+                {
+                    anomalyMsg = msgBuf;
+                }
+                OPENSSL_cleanse(msgBuf, sizeof(msgBuf));
 
                 if (m_appFacade)
                 {

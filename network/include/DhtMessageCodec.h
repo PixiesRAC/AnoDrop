@@ -2,31 +2,27 @@
 
 #include <expected>
 #include <nlohmann/json.hpp>
-#include <optional>
 #include <string>
-#include <vector>
+#include <string_view>
 
-#include "CryptoUtils.h"
+#include "Bep44Signer.h"
 #include "LobbyData.h"
+#include "LobbyDataSerializer.h"
 #include "TimeUtils.h"
 
 namespace network
 {
 
 /**
- * @brief Handles payload marshalling, unmarshalling, seed derivation, and timestamp validation for DHT items.
+ * @brief Handles payload marshalling, unmarshalling, and timestamp validation for DHT items.
  * Decouples message serialization logic from network I/O orchestration in DhtPublisher.
  */
 class DhtMessageCodec
 {
   public:
-    [[nodiscard]] static std::vector<unsigned char> deriveSeed(const std::string &key, const std::string &info = "DHTSeed")
+    [[nodiscard]] static constexpr bool fitsBep44(std::string_view payload) noexcept
     {
-        return CryptoUtils::deriveHKDF(
-            std::vector<unsigned char>(key.begin(), key.end()),
-            {},
-            info,
-            32).value_or(std::vector<unsigned char>{});
+        return payload.size() <= 1000 && Bep44Signer::bencodedStringSize(payload.size()) <= 1000;
     }
 
     [[nodiscard]] static std::expected<ChatMessage, std::string> parseChatMessage(const std::string &valueStr, std::int64_t seqNumTarget)

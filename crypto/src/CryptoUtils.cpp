@@ -1,11 +1,17 @@
 #include "CryptoUtils.h"
 
-#include <openssl/rand.h>
+#include <array>
+#include <memory>
+#include <span>
+
+#include <argon2.h>
+#include <openssl/evp.h>
 #include <openssl/kdf.h>
+#include <openssl/rand.h>
 #include <spdlog/spdlog.h>
 
+#include "SecureBuffer.h"
 #include "Util.h"
-#include <argon2.h>
 
 namespace CryptoUtils
 {
@@ -14,7 +20,7 @@ using CipherCtxPtr = std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_fr
 using PkeyCtxPtr = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
 using PkeyPtr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
 
-std::expected<std::vector<unsigned char>, std::string> encryptAES256GCM(const std::vector<unsigned char> &plaintext, const std::vector<unsigned char> &key, const std::vector<unsigned char>& aad)
+std::expected<std::vector<unsigned char>, std::string> encryptAES256GCM(std::span<const unsigned char> plaintext, std::span<const unsigned char> key, std::span<const unsigned char> aad)
 {
     if (key.size() != 32)
     {
@@ -25,18 +31,21 @@ std::expected<std::vector<unsigned char>, std::string> encryptAES256GCM(const st
     if (!ctx)
         return std::unexpected("Failed to create EVP_CIPHER_CTX");
 
-    std::vector<unsigned char> iv(12);
-    if (RAND_bytes(iv.data(), static_cast<int>(iv.size())) != 1)
+    constexpr std::size_t ivLen = 12;
+    constexpr std::size_t tagLen = 16;
+    std::vector<unsigned char> result(ivLen + plaintext.size() + tagLen);
+
+    if (RAND_bytes(result.data(), static_cast<int>(ivLen)) != 1)
     {
         return std::unexpected("Failed to generate random IV");
     }
 
-    if (EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
+    if (EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1)
     {
         return std::unexpected("Failed to init encryption");
     }
 
-    if (EVP_EncryptInit_ex(ctx.get(), NULL, NULL, key.data(), iv.data()) != 1)
+    if (EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), result.data()) != 1)
     {
         return std::unexpected("Failed to set key and IV");
     }
@@ -44,45 +53,37 @@ std::expected<std::vector<unsigned char>, std::string> encryptAES256GCM(const st
     if (!aad.empty())
     {
         int len = 0;
-        if (EVP_EncryptUpdate(ctx.get(), NULL, &len, aad.data(), static_cast<int>(aad.size())) != 1)
+        if (EVP_EncryptUpdate(ctx.get(), nullptr, &len, aad.data(), static_cast<int>(aad.size())) != 1)
         {
             return std::unexpected("Failed to set AAD");
         }
     }
 
-    std::vector<unsigned char> ciphertext(plaintext.size() + EVP_MAX_BLOCK_LENGTH);
+    unsigned char *ciphertextPtr = result.data() + ivLen;
     int len = 0;
-    int ciphertext_len = 0;
-
-    if (EVP_EncryptUpdate(ctx.get(), ciphertext.data(), &len, plaintext.data(), static_cast<int>(plaintext.size())) != 1)
+    if (EVP_EncryptUpdate(ctx.get(), ciphertextPtr, &len, plaintext.data(), static_cast<int>(plaintext.size())) != 1)
     {
         return std::unexpected("Failed to encrypt data");
     }
-    ciphertext_len = len;
+    int ciphertextLen = len;
 
-    if (EVP_EncryptFinal_ex(ctx.get(), ciphertext.data() + len, &len) != 1)
+    if (EVP_EncryptFinal_ex(ctx.get(), ciphertextPtr + ciphertextLen, &len) != 1)
     {
         return std::unexpected("Failed to finalize encryption");
     }
-    ciphertext_len += len;
-    ciphertext.resize(ciphertext_len);
+    ciphertextLen += len;
 
-    std::vector<unsigned char> tag(16);
-    if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, 16, tag.data()) != 1)
+    unsigned char *tagPtr = ciphertextPtr + ciphertextLen;
+    if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, static_cast<int>(tagLen), tagPtr) != 1)
     {
         return std::unexpected("Failed to get GCM tag");
     }
 
-    std::vector<unsigned char> result;
-    result.reserve(iv.size() + ciphertext.size() + tag.size());
-    result.insert(result.end(), iv.begin(), iv.end());
-    result.insert(result.end(), ciphertext.begin(), ciphertext.end());
-    result.insert(result.end(), tag.begin(), tag.end());
-
+    result.resize(ivLen + static_cast<std::size_t>(ciphertextLen) + tagLen);
     return result;
 }
 
-std::expected<std::vector<unsigned char>, std::string> decryptAES256GCM(const std::vector<unsigned char> &ciphertext_blob, const std::vector<unsigned char> &key, const std::vector<unsigned char>& aad)
+std::expected<std::vector<unsigned char>, std::string> decryptAES256GCM(std::span<const unsigned char> ciphertext_blob, std::span<const unsigned char> key, std::span<const unsigned char> aad)
 {
     if (key.size() != 32)
     {
@@ -93,20 +94,21 @@ std::expected<std::vector<unsigned char>, std::string> decryptAES256GCM(const st
         return std::unexpected("Ciphertext blob is too small");
     }
 
-    std::vector<unsigned char> iv(ciphertext_blob.begin(), ciphertext_blob.begin() + 12);
-    std::vector<unsigned char> tag(ciphertext_blob.end() - 16, ciphertext_blob.end());
-    std::vector<unsigned char> ciphertext(ciphertext_blob.begin() + 12, ciphertext_blob.end() - 16);
+    const auto iv = ciphertext_blob.first(12);
+    std::array<unsigned char, 16> tag{};
+    std::copy(ciphertext_blob.end() - 16, ciphertext_blob.end(), tag.begin());
+    const auto ciphertext = ciphertext_blob.subspan(12, ciphertext_blob.size() - 28);
 
     CipherCtxPtr ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
     if (!ctx)
         return std::unexpected("Failed to create EVP_CIPHER_CTX");
 
-    if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
+    if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1)
     {
         return std::unexpected("Failed to init decryption");
     }
 
-    if (EVP_DecryptInit_ex(ctx.get(), NULL, NULL, key.data(), iv.data()) != 1)
+    if (EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), iv.data()) != 1)
     {
         return std::unexpected("Failed to set key and IV");
     }
@@ -114,7 +116,7 @@ std::expected<std::vector<unsigned char>, std::string> decryptAES256GCM(const st
     if (!aad.empty())
     {
         int len = 0;
-        if (EVP_DecryptUpdate(ctx.get(), NULL, &len, aad.data(), static_cast<int>(aad.size())) != 1)
+        if (EVP_DecryptUpdate(ctx.get(), nullptr, &len, aad.data(), static_cast<int>(aad.size())) != 1)
         {
             return std::unexpected("Failed to set AAD");
         }
@@ -126,12 +128,14 @@ std::expected<std::vector<unsigned char>, std::string> decryptAES256GCM(const st
 
     if (EVP_DecryptUpdate(ctx.get(), plaintext.data(), &len, ciphertext.data(), static_cast<int>(ciphertext.size())) != 1)
     {
+        OPENSSL_cleanse(plaintext.data(), plaintext.size());
         return std::unexpected("Failed to decrypt data");
     }
     plaintext_len = len;
 
     if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, 16, tag.data()) != 1)
     {
+        OPENSSL_cleanse(plaintext.data(), plaintext.size());
         return std::unexpected("Failed to set GCM tag");
     }
 
@@ -140,16 +144,17 @@ std::expected<std::vector<unsigned char>, std::string> decryptAES256GCM(const st
     if (ret > 0)
     {
         plaintext_len += len;
-        plaintext.resize(plaintext_len);
+        plaintext.resize(static_cast<std::size_t>(plaintext_len));
         return plaintext;
     }
     else
     {
+        OPENSSL_cleanse(plaintext.data(), plaintext.size());
         return std::unexpected("Decryption failed (auth tag mismatch)");
     }
 }
 
-std::vector<unsigned char> deriveStoreKey(const std::string &password, const std::vector<unsigned char> &salt)
+std::vector<unsigned char> deriveStoreKey(std::string_view password, std::span<const unsigned char> salt)
 {
     constexpr std::uint32_t passes = 3;
     constexpr std::uint32_t memoryKiB = 64 * 1024;
@@ -171,7 +176,7 @@ std::vector<unsigned char> deriveStoreKey(const std::string &password, const std
 
 std::expected<X25519KeyPair, std::string> generateX25519KeyPair()
 {
-    PkeyCtxPtr pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL), EVP_PKEY_CTX_free);
+    PkeyCtxPtr pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, nullptr), EVP_PKEY_CTX_free);
     if (!pctx)
         return std::unexpected("Failed to create X25519 context");
 
@@ -180,7 +185,7 @@ std::expected<X25519KeyPair, std::string> generateX25519KeyPair()
         return std::unexpected("Failed to init X25519 keygen");
     }
 
-    EVP_PKEY *rawPkey = NULL;
+    EVP_PKEY *rawPkey = nullptr;
     if (EVP_PKEY_keygen(pctx.get(), &rawPkey) <= 0)
     {
         return std::unexpected("Failed to generate X25519 key");
@@ -188,35 +193,37 @@ std::expected<X25519KeyPair, std::string> generateX25519KeyPair()
     PkeyPtr pkey(rawPkey, EVP_PKEY_free);
 
     size_t pub_len = 32, priv_len = 32;
-    std::vector<unsigned char> pub_key(pub_len);
-    std::vector<unsigned char> priv_key(priv_len);
+    X25519KeyPair keyPair{std::vector<unsigned char>(pub_len), std::vector<unsigned char>(priv_len)};
 
-    if (EVP_PKEY_get_raw_public_key(pkey.get(), pub_key.data(), &pub_len) <= 0 || EVP_PKEY_get_raw_private_key(pkey.get(), priv_key.data(), &priv_len) <= 0)
+    if (EVP_PKEY_get_raw_public_key(pkey.get(), keyPair.publicKey.data(), &pub_len) <= 0 ||
+        EVP_PKEY_get_raw_private_key(pkey.get(), keyPair.privateKey.data(), &priv_len) <= 0)
     {
+        OPENSSL_cleanse(keyPair.privateKey.data(), keyPair.privateKey.size());
         return std::unexpected("Failed to extract raw X25519 keys");
     }
 
-    SPDLOG_INFO("generateX25519KeyPair: Raw generated PubKey: {}", Util::toHex(pub_key));
-    return X25519KeyPair{pub_key, priv_key};
+    SPDLOG_INFO("[HANDSHAKE] generateX25519KeyPair: Raw generated PubKey: {}", Util::toHex(keyPair.publicKey));
+    return keyPair;
 }
-std::expected<std::vector<unsigned char>, std::string> deriveX25519SharedSecret(const std::vector<unsigned char> &myPrivateKey, const std::vector<unsigned char> &peerPublicKey)
+
+std::expected<std::vector<unsigned char>, std::string> deriveX25519SharedSecret(std::span<const unsigned char> myPrivateKey, std::span<const unsigned char> peerPublicKey)
 {
     if (myPrivateKey.size() != 32 || peerPublicKey.size() != 32)
     {
         return std::unexpected("X25519 keys must be exactly 32 bytes");
     }
 
-    PkeyPtr myPrivKey(EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, myPrivateKey.data(), myPrivateKey.size()), EVP_PKEY_free);
+    PkeyPtr myPrivKey(EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, myPrivateKey.data(), myPrivateKey.size()), EVP_PKEY_free);
     if (!myPrivKey)
         return std::unexpected("Failed to load X25519 private key");
 
-    PkeyPtr peerPubKey(EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peerPublicKey.data(), peerPublicKey.size()), EVP_PKEY_free);
+    PkeyPtr peerPubKey(EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, peerPublicKey.data(), peerPublicKey.size()), EVP_PKEY_free);
     if (!peerPubKey)
     {
         return std::unexpected("Failed to load X25519 peer public key");
     }
 
-    PkeyCtxPtr ctx(EVP_PKEY_CTX_new(myPrivKey.get(), NULL), EVP_PKEY_CTX_free);
+    PkeyCtxPtr ctx(EVP_PKEY_CTX_new(myPrivKey.get(), nullptr), EVP_PKEY_CTX_free);
     if (!ctx)
     {
         return std::unexpected("Failed to create derivation context");
@@ -233,7 +240,7 @@ std::expected<std::vector<unsigned char>, std::string> deriveX25519SharedSecret(
     }
 
     size_t secretLen = 0;
-    if (EVP_PKEY_derive(ctx.get(), NULL, &secretLen) <= 0)
+    if (EVP_PKEY_derive(ctx.get(), nullptr, &secretLen) <= 0)
     {
         return std::unexpected("Failed to determine shared secret length");
     }
@@ -241,6 +248,7 @@ std::expected<std::vector<unsigned char>, std::string> deriveX25519SharedSecret(
     std::vector<unsigned char> sharedSecret(secretLen);
     if (EVP_PKEY_derive(ctx.get(), sharedSecret.data(), &secretLen) <= 0)
     {
+        OPENSSL_cleanse(sharedSecret.data(), sharedSecret.size());
         return std::unexpected("Failed to derive shared secret");
     }
     sharedSecret.resize(secretLen);
@@ -248,9 +256,9 @@ std::expected<std::vector<unsigned char>, std::string> deriveX25519SharedSecret(
     return sharedSecret;
 }
 
-std::expected<std::vector<unsigned char>, std::string> deriveHKDF(const std::vector<unsigned char>& ikm, const std::vector<unsigned char>& salt, const std::string& info, size_t outLen)
+std::expected<std::vector<unsigned char>, std::string> deriveHKDF(std::span<const unsigned char> ikm, std::span<const unsigned char> salt, std::string_view info, size_t outLen)
 {
-    PkeyCtxPtr pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL), EVP_PKEY_CTX_free);
+    PkeyCtxPtr pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr), EVP_PKEY_CTX_free);
     if (!pctx) return std::unexpected("Failed to create HKDF context");
 
     if (EVP_PKEY_derive_init(pctx.get()) <= 0)
@@ -280,7 +288,10 @@ std::expected<std::vector<unsigned char>, std::string> deriveHKDF(const std::vec
     std::vector<unsigned char> out(outLen);
     size_t len = outLen;
     if (EVP_PKEY_derive(pctx.get(), out.data(), &len) <= 0)
+    {
+        OPENSSL_cleanse(out.data(), out.size());
         return std::unexpected("Failed to derive HKDF key");
+    }
 
     out.resize(len);
     return out;

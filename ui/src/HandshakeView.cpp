@@ -3,11 +3,43 @@
 #include <ncurses.h>
 #include <openssl/crypto.h>
 
+#include "SecureBuffer.h"
+
 namespace ui
 {
-HandshakeView::HandshakeView(std::shared_ptr<AppFacade> appFacade) : m_appFacade(appFacade)
+HandshakeView::HandshakeView(std::shared_ptr<AppFacade> appFacade) : m_appFacade(std::move(appFacade))
 {
 }
+
+namespace
+{
+struct TerminalModeGuard
+{
+    TerminalModeGuard()
+    {
+        echo();
+        curs_set(1);
+    }
+    ~TerminalModeGuard()
+    {
+        restore();
+    }
+    void restore()
+    {
+        if (!restored)
+        {
+            noecho();
+            curs_set(0);
+            timeout(-1);
+            restored = true;
+        }
+    }
+    TerminalModeGuard(const TerminalModeGuard &) = delete;
+    TerminalModeGuard &operator=(const TerminalModeGuard &) = delete;
+  private:
+    bool restored{false};
+};
+} // namespace
 
 void HandshakeView::show()
 {
@@ -15,33 +47,45 @@ void HandshakeView::show()
     mvprintw(2, 4, "=== Handshake ===");
     mvprintw(4, 4, "Enter Channel Name (Passphrase): ");
 
-    echo();
-    curs_set(1);
-    char channelName[256];
-    getnstr(channelName, 255);
-    std::string passphrase(channelName);
-    OPENSSL_cleanse(channelName, sizeof(channelName));
-
-    if (m_appFacade && m_appFacade->unhideLobbyIfExists(passphrase))
+    std::string passphrase;
+    std::string pseudo;
     {
-        noecho();
-        curs_set(0);
-        mvprintw(7, 4, "Lobby was hidden. It is now restored!");
-        mvprintw(9, 4, "Press any key to return to menu...");
-        refresh();
-        getch();
-        return;
+        TerminalModeGuard modeGuard;
+
+        char channelName[256] = {0};
+        if (getnstr(channelName, 255) == ERR)
+        {
+            OPENSSL_cleanse(channelName, sizeof(channelName));
+            return;
+        }
+        passphrase = channelName;
+        OPENSSL_cleanse(channelName, sizeof(channelName));
     }
+    ScopedCleanse passphraseGuard(passphrase);
+    {
+        TerminalModeGuard modeGuard;
 
-    mvprintw(5, 4, "Enter your Pseudo: ");
-    char pseudoBuf[256];
-    getnstr(pseudoBuf, 255);
+        if (m_appFacade && m_appFacade->unhideLobbyIfExists(passphrase))
+        {
+            modeGuard.restore();
+            mvprintw(7, 4, "Lobby was hidden. It is now restored!");
+            mvprintw(9, 4, "Press any key to return to menu...");
+            refresh();
+            getch();
+            return;
+        }
 
-    noecho();
-    curs_set(0);
+        mvprintw(5, 4, "Enter your Pseudo: ");
+        char pseudoBuf[256] = {0};
+        if (getnstr(pseudoBuf, 255) == ERR)
+        {
+            OPENSSL_cleanse(pseudoBuf, sizeof(pseudoBuf));
+            return;
+        }
 
-    std::string pseudo(pseudoBuf);
-    OPENSSL_cleanse(pseudoBuf, sizeof(pseudoBuf));
+        pseudo = pseudoBuf;
+        OPENSSL_cleanse(pseudoBuf, sizeof(pseudoBuf));
+    }
 
     try
     {

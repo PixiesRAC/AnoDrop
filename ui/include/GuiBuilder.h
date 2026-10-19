@@ -2,8 +2,6 @@
 
 #include "AppFacade.h"
 
-class DhtChatHandler;
-
 namespace ui
 {
 class GuiBuilder

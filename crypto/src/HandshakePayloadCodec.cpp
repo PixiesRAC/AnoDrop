@@ -1,25 +1,34 @@
-#include <nlohmann/json.hpp>
-#include "LobbyDataSerializer.h"
 #include "HandshakePayloadCodec.h"
 
+#include <nlohmann/json.hpp>
+#include <span>
+
 #include "CryptoUtils.h"
+#include "SecureBuffer.h"
 
 std::expected<nlohmann::json, std::string> HandshakePayloadCodec::decryptDhtHandShakePayload(const std::string &ciphertextStr, const std::string &lobbyName)
 {
     try
     {
-        std::vector<unsigned char> ciphertext(ciphertextStr.begin(), ciphertextStr.end());
-        std::vector<unsigned char> lobbyKey = CryptoUtils::deriveHKDF(std::vector<unsigned char>(lobbyName.begin(), lobbyName.end()), {}, "HandshakeKey", 32).value_or(std::vector<unsigned char>());
-        if (lobbyKey.empty())
-            return std::unexpected("Failed to derive lobby key");
+        std::span<const unsigned char> ciphertext(
+            reinterpret_cast<const unsigned char *>(ciphertextStr.data()),
+            ciphertextStr.size());
+        std::span<const unsigned char> lobbySpan(reinterpret_cast<const unsigned char *>(lobbyName.data()), lobbyName.size());
+        auto lobbyKeyRes = CryptoUtils::deriveHKDF(lobbySpan, {}, "HandshakeKey", 32);
+        if (!lobbyKeyRes)
+            return std::unexpected(std::move(lobbyKeyRes).error());
+        auto lobbyKey = std::move(*lobbyKeyRes);
+        ScopedCleanse keyGuard(lobbyKey);
+
         auto plaintextRes = CryptoUtils::decryptAES256GCM(ciphertext, lobbyKey);
         if (!plaintextRes)
         {
-            return std::unexpected(plaintextRes.error());
+            return std::unexpected(std::move(plaintextRes).error());
         }
-        std::vector<unsigned char> plaintext = *plaintextRes;
-        std::string jsonStr(plaintext.begin(), plaintext.end());
-        return nlohmann::json::parse(jsonStr);
+        auto plaintext = std::move(*plaintextRes);
+        ScopedCleanse plainGuard(plaintext);
+
+        return nlohmann::json::parse(plaintext.begin(), plaintext.end());
     }
     catch (const std::exception &e)
     {
@@ -30,20 +39,24 @@ std::expected<nlohmann::json, std::string> HandshakePayloadCodec::decryptDhtHand
 std::expected<std::vector<unsigned char>, std::string> HandshakePayloadCodec::encryptDhtHandshakePayload(const nlohmann::json &payload, const std::string &lobbyName)
 {
     std::string jsonStr = payload.dump();
+    ScopedCleanse jsonGuard(jsonStr);
     std::span<const unsigned char> plaintextBytes(
         reinterpret_cast<const unsigned char *>(jsonStr.data()),
         jsonStr.size());
 
-    std::vector<unsigned char> lobbyKey = CryptoUtils::deriveHKDF(std::vector<unsigned char>(lobbyName.begin(), lobbyName.end()), {}, "HandshakeKey", 32).value_or(std::vector<unsigned char>());
-    if (lobbyKey.empty())
-        return std::unexpected("Failed to derive lobby key");
-    auto encryptedRes = CryptoUtils::encryptAES256GCM(
-        std::vector<unsigned char>(plaintextBytes.begin(), plaintextBytes.end()), lobbyKey);
+    std::span<const unsigned char> lobbySpan(reinterpret_cast<const unsigned char *>(lobbyName.data()), lobbyName.size());
+    auto lobbyKeyRes = CryptoUtils::deriveHKDF(lobbySpan, {}, "HandshakeKey", 32);
+    if (!lobbyKeyRes)
+        return std::unexpected(std::move(lobbyKeyRes).error());
+    auto lobbyKey = std::move(*lobbyKeyRes);
+    ScopedCleanse keyGuard(lobbyKey);
+
+    auto encryptedRes = CryptoUtils::encryptAES256GCM(plaintextBytes, lobbyKey);
 
     if (!encryptedRes)
     {
-        return std::unexpected(encryptedRes.error());
+        return std::unexpected(std::move(encryptedRes).error());
     }
 
-    return *encryptedRes;
+    return std::move(*encryptedRes);
 }

@@ -1,4 +1,3 @@
-#include "LobbyDataSerializer.h"
 #include <iostream>
 #include <memory>
 #include <spdlog/spdlog.h>
@@ -31,10 +30,20 @@ int main(int argc, char *argv[])
         }
     }
 
-    Config config(argc, argv);
+    std::unique_ptr<Config> configPtr;
+    try
+    {
+        configPtr = std::make_unique<Config>(argc, argv);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Configuration error: " << e.what() << "\n";
+        return 1;
+    }
+    const Config &config = *configPtr;
     Logger::init(config.getLogPath(), config.getLogLevel());
 
-    SPDLOG_INFO("Config: LogPath={}, LogLevel={}, StorePath={}, NetworkInterface={}, MaxConcurrentFetches={}, FetchInterval={}ms, PullMessagesOnStartup={}", 
+    SPDLOG_INFO("[BOOT] Config: LogPath={}, LogLevel={}, StorePath={}, NetworkInterface={}, MaxConcurrentFetches={}, FetchInterval={}ms, PullMessagesOnStartup={}",
                 config.getLogPath(), config.getLogLevel(), config.getStorePath(), config.getNetworkInterface(),
                 config.getMaxConcurrentFetches(), config.getFetchInterval(), config.getPullMessagesOnStartup());
 
@@ -47,7 +56,7 @@ int main(int argc, char *argv[])
 
     while (true)
     {
-        const std::string masterPwd = ui::Unlock::askMasterPassword(errorMessage);
+        std::string masterPwd = ui::Unlock::askMasterPassword(errorMessage);
         if (masterPwd.empty())
         {
             return 0;
@@ -56,10 +65,12 @@ int main(int argc, char *argv[])
         try
         {
             lobbyStore = std::make_shared<LobbyStore>(masterPwd, storePath);
+            OPENSSL_cleanse(masterPwd.data(), masterPwd.size());
             break;
         }
         catch (const std::exception &e)
         {
+            OPENSSL_cleanse(masterPwd.data(), masterPwd.size());
             errorMessage = e.what();
         }
     }
@@ -71,32 +82,32 @@ int main(int argc, char *argv[])
     }
     catch (const std::exception &e)
     {
-        SPDLOG_CRITICAL("Failed to initialize DHT Manager: {}", e.what());
+        SPDLOG_CRITICAL("[BOOT] Failed to initialize DHT Manager: {}", e.what());
         gui.resetTerminal();
         std::cerr << "\n\033[1;31m[AnoDrop KILLSWITCH ERROR] " << e.what() << "\033[0m\n\n";
         return 1;
     }
-    dhtManager->setLobbyStore(lobbyStore);
-    std::shared_ptr<DhtPublisher> dhtPublisher = std::make_shared<DhtPublisher>();
-    dhtPublisher->setMaxConcurrentFetches(config.getMaxConcurrentFetches());
+    std::shared_ptr<DhtPublisher> dhtPublisher;
 
-    if (dhtManager->isSessionReady())
+    if (dhtManager->hasSession())
     {
         dhtManager->startAlertThread();
-        dhtManager->waitUntilDhtIsReady();
-        dhtPublisher->setDhtManager(std::move(dhtManager));
+        if (!dhtManager->waitUntilDhtIsReady()) {
+            SPDLOG_WARN("[BOOT] DHT bootstrap timed out; continuing with background recovery");
+        }
+        dhtPublisher = std::make_shared<DhtPublisher>(lobbyStore, std::move(dhtManager), config.getMaxConcurrentFetches());
         
         auto appFacade = std::make_unique<AppFacade>(dhtPublisher, lobbyStore, config.getPullMessagesOnStartup());
         if (config.getPullMessagesOnStartup())
         {
-            SPDLOG_INFO("PullMessagesOnStartup is enabled: Synchronizing all active lobbies.");
+            SPDLOG_INFO("[BOOT] PullMessagesOnStartup is enabled: Synchronizing all active lobbies.");
             appFacade->synchronizeAllActiveLobbies();
         }
         gui.setAppFacade(std::move(appFacade));
     }
     else
     {
-        SPDLOG_ERROR("Failed to create DHT session ... exiting!");
+        SPDLOG_ERROR("[BOOT] Failed to create DHT session ... exiting!");
         return 1;
     }
 
@@ -105,10 +116,10 @@ int main(int argc, char *argv[])
     lobbyStateFetcher->ProcessLobbies();
     gui.buildAndRun();
 
-    SPDLOG_INFO("Shutting down AnoDrop...");
+    SPDLOG_INFO("[SHUTDOWN] Shutting down AnoDrop...");
     lobbyStateFetcher->stop();
     gui.shutdown();
     dhtPublisher->shutdown();
-    SPDLOG_INFO("AnoDrop shutdown completed cleanly.");
+    SPDLOG_INFO("[SHUTDOWN] AnoDrop shutdown completed cleanly.");
     return 0;
 }

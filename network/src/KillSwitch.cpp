@@ -1,12 +1,9 @@
 #include "KillSwitch.h"
 
-#include <chrono>
 #include <cstdlib>
 #include <iostream>
-#include <thread>
 #include <spdlog/spdlog.h>
 
-#include <curses.h>
 #include "NetworkUtils.h"
 
 KillSwitch &KillSwitch::getInstance()
@@ -17,20 +14,19 @@ KillSwitch &KillSwitch::getInstance()
 
 void KillSwitch::init(const std::string &networkInterface)
 {
-    m_configuredInterface = networkInterface;
     m_tickCounter = 0;
 
     if (networkInterface.empty() || networkInterface == "any")
     {
         m_boundInterface = "any";
         m_enabled = false;
-        SPDLOG_INFO("[KillSwitch] Disabled (network_interface='any')");
+        SPDLOG_INFO("[KILLSWITCH] [KillSwitch] Disabled (network_interface='any')");
         return;
     }
 
     m_boundInterface = networkInterface;
     m_enabled = true;
-    SPDLOG_INFO("[KillSwitch] Target interface: '{}' (binding via Libtorrent, startup failure handled by listen_failed_alert)", m_boundInterface);
+    SPDLOG_INFO("[KILLSWITCH] [KillSwitch] Target interface: '{}' (binding via Libtorrent, startup failure handled by listen_failed_alert)", m_boundInterface);
 }
 
 void KillSwitch::checkHealth()
@@ -69,23 +65,9 @@ void KillSwitch::handleListenFailed(const std::string &errorMessage)
         std::quick_exit(EXIT_FAILURE);
     }
 
-    SPDLOG_CRITICAL("{}", reason);
+    SPDLOG_CRITICAL("[KILLSWITCH] {}", reason);
 
-    // Give a short grace period (50ms) to allow UI thread loops to observe isTriggered() and break
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Reset curses terminal if initialized so the user's terminal isn't corrupted
-    try
-    {
-        if (!isendwin())
-        {
-            endwin();
-        }
-    }
-    catch (...)
-    {
-    }
-
+    // Terminal mode restoration is handled by the quick-exit hook without ncurses.
     // Print bold red alert message to stderr and flush
     std::cerr << "\n\033[1;31m" << reason << "\033[0m\n\n" << std::flush;
     std::fflush(nullptr);
@@ -108,7 +90,3 @@ const std::string &KillSwitch::getBoundInterface() const
     return m_boundInterface;
 }
 
-const std::string &KillSwitch::getConfiguredInterface() const
-{
-    return m_configuredInterface;
-}

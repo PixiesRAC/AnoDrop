@@ -1,8 +1,9 @@
 #pragma once
 
 #include "LobbyData.h"
-#include <string>
 #include <map>
+#include <span>
+#include <string>
 #include <vector>
 
 namespace ui
@@ -18,12 +19,12 @@ class MessageStatusResolver
     static constexpr const char* STATUS_SENT = " [Sent]";
     static constexpr const char* STATUS_SENDING = " [Sending...]";
 
-    static void buildResyncMaps(const std::vector<ChatMessage> &messages,
+    static void buildResyncMaps(std::span<const ChatMessage> messages,
                                 std::map<std::int64_t, std::vector<std::int64_t>> &origToResyncs,
                                 std::map<std::int64_t, std::int64_t> &resyncToOrig);
 
     [[nodiscard]] static std::pair<std::string, int> resolveStatus(const ChatMessage &msg,
-                                                     const LobbyData &lobbyData,
+                                                     const LobbyViewData &lobbyData,
                                                      const std::map<std::int64_t, std::vector<std::int64_t>> &origToResyncs,
                                                      const std::map<std::int64_t, std::int64_t> &resyncToOrig);
 };

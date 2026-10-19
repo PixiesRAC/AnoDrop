@@ -25,7 +25,6 @@ public:
     [[nodiscard]] bool isEnabled() const;
     [[nodiscard]] bool isTriggered() const;
     [[nodiscard]] const std::string &getBoundInterface() const;
-    [[nodiscard]] const std::string &getConfiguredInterface() const;
 
 private:
     KillSwitch() = default;
@@ -33,7 +32,6 @@ private:
     KillSwitch(const KillSwitch &) = delete;
     KillSwitch &operator=(const KillSwitch &) = delete;
 
-    std::string m_configuredInterface{"any"};
     std::string m_boundInterface{"any"};
     bool m_enabled{false};
     int m_tickCounter{0};

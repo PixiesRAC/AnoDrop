@@ -1,34 +1,20 @@
 #pragma once
-#include <cstdint>
+#include "LobbyUpdate.h"
 #include <expected>
-#include <memory>
-#include <optional>
 #include <string>
-#include <vector>
-#include <nlohmann/json.hpp>
 
-class LobbyStore;
-
-struct HandshakeTransitionResult
-{
+struct HandshakeTransitionResult {
     bool shouldWrite{false};
     std::string payloadToWrite;
-    std::int64_t targetSequenceNumber{0};
+    std::int64_t targetSequenceNumber{};
+    LobbyUpdate update;
+    bool established{false};
 };
 
-class HandshakeStateEngine
-{
-  public:
-    [[nodiscard]] static std::optional<std::vector<unsigned char>> prepareLobbyPayload(std::shared_ptr<LobbyStore> lobbyStore, const std::string &lobbyName, const std::string &pseudo);
-    [[nodiscard]] static nlohmann::json resolvePayload(const nlohmann::json &rawPayload, const std::string &lobbyName, std::shared_ptr<LobbyStore> lobbyStore);
-    [[nodiscard]] static std::expected<std::vector<unsigned char>, std::string> mergeHandshakePayloads(const nlohmann::json &oldDecrypted, const nlohmann::json &myPeerInfo, const std::string &lobbyName);
-    [[nodiscard]] static nlohmann::json generateFakePeersArray();
-
-    [[nodiscard]] static HandshakeTransitionResult processHandshakeTransition(
-        const std::string &ourEncryptedPayload,
-        const std::string &lobbyName,
-        std::shared_ptr<LobbyStore> lobbyStore,
-        std::int64_t currentDhtSeqNum,
-        const std::string &existingItemString,
-        bool hasExistingItem);
+class HandshakeStateEngine {
+public:
+    // Pure transition: no storage, callbacks or shared state.
+    [[nodiscard]] static std::expected<HandshakeTransitionResult, std::string> processHandshakeTransition(
+        const std::string& ownPayload, const LobbyData& local,
+        std::int64_t sequence, const std::string& existing, bool found);
 };

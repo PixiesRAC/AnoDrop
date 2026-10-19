@@ -1,8 +1,8 @@
 #include "ChatViewModel.h"
 
 #include <algorithm>
+#include <climits>
 #include <ctime>
-#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include "ChatConstants.h"
@@ -35,7 +35,7 @@ void ChatViewModel::setDimensions(int chatAreaHeight, int screenWidth)
     }
 }
 
-std::string ChatViewModel::formatMessagePrefix(const ChatMessage &msg, const LobbyData &lobbyData) const
+std::string ChatViewModel::formatMessagePrefix(const ChatMessage &msg, const LobbyViewData &lobbyData) const
 {
     std::time_t ts = static_cast<std::time_t>(msg.fake_timestamp);
     std::tm tm_info{};
@@ -65,38 +65,8 @@ void ChatViewModel::triggerRateLimitWarning(int count)
 
 void ChatViewModel::indexNewMessages(std::span<const ChatMessage> messages)
 {
-    if (messages.size() != m_lastIndexedMessageCount)
-    {
-        if (messages.size() < m_lastIndexedMessageCount)
-        {
-            m_origToResyncs.clear();
-            m_resyncToOrig.clear();
-            m_lastIndexedMessageCount = 0;
-        }
-
-        for (size_t idx = m_lastIndexedMessageCount; idx < messages.size(); ++idx)
-        {
-            const auto &m = messages[idx];
-            if (m.direction == MessageDirection::OUT && m.content.find(chat::RESYNC_PREFIX) == 0)
-            {
-                size_t start = chat::RESYNC_PREFIX.length();
-                size_t end = m.content.find(" ", start);
-                if (end != std::string::npos)
-                {
-                    try
-                    {
-                        std::int64_t origSeq = std::stoll(m.content.substr(start, end - start));
-                        m_origToResyncs[origSeq].push_back(m.seq_num);
-                        m_resyncToOrig[m.seq_num] = origSeq;
-                    }
-                    catch (...)
-                    {
-                    }
-                }
-            }
-        }
-        m_lastIndexedMessageCount = messages.size();
-    }
+    MessageStatusResolver::buildResyncMaps(messages, m_origToResyncs, m_resyncToOrig);
+    m_lastIndexedMessageCount += messages.size();
 }
 
 void ChatViewModel::rebuildViewData()
@@ -104,7 +74,7 @@ void ChatViewModel::rebuildViewData()
     if (!m_lobbyObserver)
         return;
 
-    m_lobbyData = m_lobbyObserver->getLobbyDataWithoutHistory();
+    m_lobbyData = m_lobbyObserver->getViewData();
 
     std::string lobbyName = m_lobbyData.metadata.lobby_name.empty() ? "Unknown" : m_lobbyData.metadata.lobby_name;
     std::string pseudo1 = m_lobbyData.metadata.my_pseudo.empty() ? "Me" : m_lobbyData.metadata.my_pseudo;
@@ -131,7 +101,7 @@ void ChatViewModel::rebuildViewData()
 
     m_header.showConnectionStatus = (m_lobbyData.metadata.status == LobbyStatus::HANDSHAKE_DONE ||
                                      m_lobbyData.metadata.status == LobbyStatus::ANOMALY);
-    m_header.isPeerConnected = m_lobbyObserver->isPeerConnected();
+    m_header.isPeerConnected = m_lobbyData.metadata.isPeerConnected();
 
     if (!m_lobbyData.metadata.fake_timezone.name.empty())
     {
@@ -145,28 +115,33 @@ void ChatViewModel::rebuildViewData()
     m_visibleLines.clear();
     size_t newReadCount = 0;
 
-    m_lobbyObserver->withHistory([&](std::span<const ChatMessage> messages) {
-        m_totalMessageCount = messages.size();
-        newReadCount = messages.size();
-
-        if (messages.empty())
-        {
-            return;
-        }
-
-        int totalMessages = static_cast<int>(messages.size());
-        m_maxScroll = std::max(0, totalMessages - m_chatAreaHeight);
-        m_scrollOffset = std::clamp(m_scrollOffset, 0, m_maxScroll);
-
-        int startIdx = std::max(0, totalMessages - m_chatAreaHeight - m_scrollOffset);
-        int endIdx = std::min(totalMessages, startIdx + m_chatAreaHeight);
-
-        indexNewMessages(messages);
-
-        for (int i = startIdx; i < endIdx; ++i)
-        {
-            const auto &msg = messages[static_cast<size_t>(i)];
-
+    m_totalMessageCount = m_lobbyObserver->historySize();
+    newReadCount = m_totalMessageCount;
+    const auto totalMessages = static_cast<int>(std::min(m_totalMessageCount, static_cast<std::size_t>(INT_MAX)));
+    m_maxScroll = std::max(0, totalMessages - m_chatAreaHeight);
+    m_scrollOffset = std::clamp(m_scrollOffset, 0, m_maxScroll);
+    const auto start = static_cast<std::size_t>(std::max(0, totalMessages - m_chatAreaHeight - m_scrollOffset));
+    const auto count = static_cast<std::size_t>(m_chatAreaHeight);
+    const bool pageMatches = m_hasCachedPage && m_cachedPage.offset == start &&
+        m_cachedPage.count == count && m_cachedPage.total == m_totalMessageCount;
+    if (!m_historyFuture.valid() && (!pageMatches || m_lastIndexedMessageCount < m_totalMessageCount)) {
+        auto observer = m_lobbyObserver;
+        const auto total = m_totalMessageCount;
+        const auto indexOffset = m_lastIndexedMessageCount;
+        m_historyFuture = m_tasks.submit([observer, start, count, total, indexOffset, pageMatches] {
+            HistoryPage page;
+            page.offset = start; page.count = count; page.total = total; page.indexOffset = indexOffset;
+            page.loadedVisible = !pageMatches;
+            if (page.loadedVisible) page.visible = observer->historyPage(start, count);
+            page.toIndex = observer->historyPage(indexOffset, 256);
+            return page;
+        });
+    }
+    // Keep rendering the last known page while the worker fetches the new one,
+    // avoiding a blank screen flicker during scrolling.
+    const std::vector<ChatMessage> emptyPage;
+    const auto& visible = m_hasCachedPage ? m_cachedPage.visible : emptyPage;
+    for (const auto& msg : visible) {
             std::string statusStr = "";
             int statusColorPair = 0;
 
@@ -209,19 +184,19 @@ void ChatViewModel::rebuildViewData()
                 .statusColorPair = statusColorPair,
                 .textColorPair = textColorPair,
                 .isBold = isBold,
-                .isOutgoing = isOut,
                 .displayX = xPos,
             });
-        }
-    });
-
-    // Mark as read OUTSIDE withHistory lock
-    if (m_dhtChat && newReadCount > m_lobbyData.metadata.read_messages_count)
-    {
-        nlohmann::json patch = {{"read_messages_count", newReadCount}};
-        m_dhtChat->dispatchPatch(patch);
-        m_lobbyData.metadata.read_messages_count = newReadCount;
     }
+
+    if (m_dhtChat && pageMatches && !m_readFuture.valid() && newReadCount > m_markedReadCount &&
+        newReadCount > m_lobbyData.metadata.read_messages_count) {
+        auto chat = m_dhtChat;
+        m_readFuture = m_tasks.submit([chat, newReadCount] {
+            chat->markRead(newReadCount);
+            return newReadCount;
+        });
+    }
+
 }
 
 bool ChatViewModel::update()
@@ -229,7 +204,7 @@ bool ChatViewModel::update()
     if (!m_lobbyObserver)
         return false;
 
-    bool needsRedraw = false;
+    bool needsRedraw = collectCompletedWork();
 
     if (m_dimensionsChanged)
     {
@@ -312,11 +287,6 @@ void ChatViewModel::deleteLastInputChar()
     }
 }
 
-void ChatViewModel::clearInput()
-{
-    m_currentInput.clear();
-}
-
 ChatViewModel::EnterResult ChatViewModel::handleEnter()
 {
     if (m_focusIndex == 1)
@@ -328,14 +298,15 @@ ChatViewModel::EnterResult ChatViewModel::handleEnter()
     {
         if (m_dhtChat && m_lobbyObserver)
         {
-            int skipped = chat::ChatResyncer::resyncPendingMessages(*m_lobbyObserver, *m_dhtChat);
-            if (skipped > 0)
-            {
-                triggerRateLimitWarning(skipped);
-            }
-            m_scrollOffset = 0;
+            if (m_resyncFuture.valid() || m_sendFuture.valid()) return EnterResult::None;
+            auto observer = m_lobbyObserver;
+            auto chat = m_dhtChat;
+            m_resyncFuture = m_tasks.submit([observer, chat] {
+                return chat::ChatResyncer::resyncPendingMessages(*observer, *chat);
+            });
+            m_statusWarning = "Resynchronizing...";
+            m_statusWarningTime = std::chrono::steady_clock::now();
             m_focusIndex = 0;
-            rebuildViewData();
             return EnterResult::ResyncTriggered;
         }
         return EnterResult::None;
@@ -345,23 +316,66 @@ ChatViewModel::EnterResult ChatViewModel::handleEnter()
     {
         if (!m_currentInput.empty() && m_dhtChat)
         {
-            if (m_dhtChat->sendMessage(m_currentInput) != -1)
-            {
-                m_currentInput.clear();
-                m_scrollOffset = 0;
-                rebuildViewData();
-                return EnterResult::MessageSent;
-            }
-            else
-            {
-                triggerRateLimitWarning(1);
-                rebuildViewData();
-                return EnterResult::RateLimitHit;
-            }
+            if (m_sendFuture.valid() || m_resyncFuture.valid()) return EnterResult::None;
+            auto chat = m_dhtChat;
+            m_submittedInput = m_currentInput;
+            m_sendFuture = m_tasks.submit([chat, text = m_submittedInput] { return chat->sendMessage(text); });
+            m_statusWarning = "Saving message...";
+            m_statusWarningTime = std::chrono::steady_clock::now();
+            return EnterResult::None;
+
         }
     }
 
     return EnterResult::None;
+}
+
+void ChatViewModel::showSendError(SendError error)
+{
+    switch (error) {
+    case SendError::RateLimited: triggerRateLimitWarning(1); break;
+    case SendError::TooLarge: m_statusWarning = "Message exceeds BEP44 size limit."; break;
+    case SendError::RecoveryRequired: m_statusWarning = "Storage needs recovery. Reopen AnoDrop before retrying this message."; break;
+    case SendError::StorageFailed: m_statusWarning = "Storage failed; message was not accepted."; break;
+    case SendError::Unavailable: m_statusWarning = "Chat is not ready."; break;
+    case SendError::SequenceExhausted: m_statusWarning = "Message sequence exhausted."; break;
+    }
+    m_statusWarningTime = std::chrono::steady_clock::now();
+}
+
+bool ChatViewModel::collectCompletedWork()
+{
+    const auto ready = [](auto& future) { return future.valid() && future.wait_for(std::chrono::seconds(0)) == std::future_status::ready; };
+    bool changed = false;
+    auto collect = [&](auto& future, auto consume) {
+        if (!ready(future)) return;
+        changed = true;
+        try { consume(); }
+        catch (const std::exception& error) {
+            m_statusWarning = std::string("Chat operation failed: ") + error.what();
+            m_statusWarningTime = std::chrono::steady_clock::now();
+        }
+    };
+    collect(m_historyFuture, [&] {
+        auto page = m_historyFuture.get();
+        if (page.indexOffset == m_lastIndexedMessageCount) indexNewMessages(page.toIndex);
+        if (page.loadedVisible) { m_cachedPage = std::move(page); m_hasCachedPage = true; }
+    });
+    collect(m_sendFuture, [&] {
+        auto sent = m_sendFuture.get();
+        if (!sent) { showSendError(sent.error()); return; }
+        if (m_currentInput == m_submittedInput) m_currentInput.clear();
+        m_scrollOffset = 0;
+        m_statusWarning.clear();
+    });
+    collect(m_resyncFuture, [&] {
+        const auto skipped = m_resyncFuture.get();
+        m_statusWarning.clear();
+        if (skipped > 0) { m_statusWarning = std::to_string(skipped) + " resync message(s) could not be queued."; m_statusWarningTime = std::chrono::steady_clock::now(); }
+        m_scrollOffset = 0;
+    });
+    collect(m_readFuture, [&] { m_markedReadCount = m_readFuture.get(); });
+    return changed;
 }
 
 } // namespace ui

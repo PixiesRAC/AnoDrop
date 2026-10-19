@@ -1,145 +1,101 @@
 #pragma once
-
 #include <openssl/crypto.h>
-#include <nlohmann/json.hpp>
+#include <format>
+#include <memory>
+#include <span>
 #include <string>
 #include <string_view>
-#include <utility>
-#include <span>
-#include <vector>
+#include <nlohmann/json.hpp>
 
-/**
- * @brief Move-aware, RAII-governed secure string/buffer.
- *
- * Guarantees zeroization via OPENSSL_cleanse() on destruction, reassignment,
- * and clear() calls. Protects cryptographic keys, tokens, and shared secrets in memory.
- */
-class SecureString
-{
+// Immutable shared secret: copying a handle never duplicates the bytes.
+// Moves transfer ownership; the final owner wipes the storage.
+// TODO: Consider backing Storage with OPENSSL_secure_malloc / mlock to prevent
+// memory pages containing plaintext secrets from being swapped to disk by the kernel.
+class SecureString {
+    struct Storage {
+        explicit Storage(std::string_view value) : bytes(value) {}
+        ~Storage() { if (!bytes.empty()) OPENSSL_cleanse(bytes.data(), bytes.size()); }
+        Storage(const Storage&) = delete;
+        Storage& operator=(const Storage&) = delete;
+        std::string bytes;
+    };
+    std::shared_ptr<const Storage> value_;
 public:
     SecureString() = default;
-
-    explicit SecureString(std::string s) : m_data(std::move(s)) {}
-    SecureString(const char *s) : m_data(s ? s : "") {}
-    SecureString(std::string_view sv) : m_data(sv) {}
-    SecureString(std::span<const unsigned char> bytes)
-        : m_data(reinterpret_cast<const char *>(bytes.data()), bytes.size()) {}
-
-    ~SecureString()
-    {
-        cleanse();
+    SecureString(std::string value) : value_(std::make_shared<Storage>(value)) {
+        if (!value.empty()) OPENSSL_cleanse(value.data(), value.size());
     }
-
-    SecureString(SecureString &&other) noexcept
-        : m_data(std::move(other.m_data))
-    {
+    SecureString(const char* value) : SecureString(std::string_view(value ? value : "")) {}
+    SecureString(std::string_view value) : value_(std::make_shared<Storage>(value)) {}
+    SecureString(std::span<const unsigned char> value)
+        : SecureString(std::string_view(reinterpret_cast<const char*>(value.data()), value.size())) {}
+    SecureString(const SecureString&) = default;
+    SecureString& operator=(const SecureString&) = default;
+    SecureString(SecureString&&) noexcept = default;
+    SecureString& operator=(SecureString&&) noexcept = default;
+    SecureString& operator=(std::string value) { *this = SecureString(std::move(value)); return *this; }
+    SecureString& operator=(std::string_view value) { *this = SecureString(value); return *this; }
+    SecureString& operator=(const char* value) { *this = SecureString(value); return *this; }
+    void clear() noexcept { value_.reset(); }
+    // Releases this handle; bytes are wiped only when the final owner releases them.
+    void reset() noexcept { clear(); }
+    const std::string& str() const noexcept { static const std::string empty; return value_ ? value_->bytes : empty; }
+    const char* data() const noexcept { return str().data(); }
+    const char* c_str() const noexcept { return str().c_str(); }
+    std::size_t size() const noexcept { return str().size(); }
+    std::size_t length() const noexcept { return size(); }
+    bool empty() const noexcept { return size() == 0; }
+    bool starts_with(std::string_view prefix) const noexcept { return std::string_view(str()).starts_with(prefix); }
+    bool starts_with(char c) const noexcept { return std::string_view(str()).starts_with(c); }
+    std::string_view substr(std::size_t pos = 0, std::size_t count = std::string_view::npos) const noexcept {
+        return std::string_view(str()).substr(pos, count);
     }
-
-    SecureString &operator=(SecureString &&other) noexcept
-    {
-        if (this != &other)
-        {
-            cleanse();
-            m_data = std::move(other.m_data);
-        }
-        return *this;
+    operator const std::string&() const noexcept { return str(); }
+    operator std::string_view() const noexcept { return str(); }
+    bool operator==(const SecureString& rhs) const noexcept {
+        if (size() != rhs.size()) return false;
+        return CRYPTO_memcmp(data(), rhs.data(), size()) == 0;
     }
-
-    SecureString(const SecureString &other)
-        : m_data(other.m_data)
-    {
+    bool operator==(const std::string& rhs) const noexcept {
+        if (size() != rhs.size()) return false;
+        return CRYPTO_memcmp(data(), rhs.data(), size()) == 0;
     }
-
-    SecureString &operator=(const SecureString &other)
-    {
-        if (this != &other)
-        {
-            cleanse();
-            m_data = other.m_data;
-        }
-        return *this;
+    bool operator==(const char* rhs) const noexcept {
+        if (!rhs) return empty();
+        return std::string_view(str()) == std::string_view(rhs);
     }
-
-    SecureString &operator=(std::string s)
-    {
-        cleanse();
-        m_data = std::move(s);
-        return *this;
+    friend bool operator==(const char* lhs, const SecureString& rhs) noexcept {
+        return rhs == lhs;
     }
-
-    SecureString &operator=(const char *s)
-    {
-        cleanse();
-        m_data = s ? s : "";
-        return *this;
+    friend bool operator==(const std::string& lhs, const SecureString& rhs) noexcept {
+        return rhs == lhs;
     }
+    auto operator<=>(const SecureString& rhs) const noexcept { return str() <=> rhs.str(); }
+    friend std::string operator+(const SecureString& a, const std::string& b) { return a.str() + b; }
+    friend std::string operator+(const SecureString& a, const char* b) { return a.str() + b; }
+    friend std::string operator+(const std::string& a, const SecureString& b) { return a + b.str(); }
+    friend std::string operator+(const char* a, const SecureString& b) { return std::string(a ? a : "") + b.str(); }
+};
+inline void to_json(nlohmann::json& j, const SecureString& value) { j = value.str(); }
+inline void from_json(const nlohmann::json& j, SecureString& value) { value = j.get<std::string>(); }
 
-    SecureString &operator=(std::string_view sv)
-    {
-        cleanse();
-        m_data = sv;
-        return *this;
+template <>
+struct std::formatter<SecureString> : std::formatter<std::string_view> {
+    auto format(const SecureString& s, std::format_context& ctx) const {
+        return std::formatter<std::string_view>::format(std::string_view(s), ctx);
     }
-
-    void cleanse() noexcept
-    {
-        if (!m_data.empty())
-        {
-            OPENSSL_cleanse(m_data.data(), m_data.size());
-            m_data.clear();
-        }
-    }
-
-    void clear() noexcept
-    {
-        cleanse();
-    }
-
-    [[nodiscard]] const std::string &str() const noexcept { return m_data; }
-    [[nodiscard]] const char *c_str() const noexcept { return m_data.c_str(); }
-    [[nodiscard]] const char *data() const noexcept { return m_data.data(); }
-    [[nodiscard]] char *data() noexcept { return m_data.data(); }
-    [[nodiscard]] std::size_t size() const noexcept { return m_data.size(); }
-    [[nodiscard]] std::size_t length() const noexcept { return m_data.length(); }
-    [[nodiscard]] bool empty() const noexcept { return m_data.empty(); }
-
-    operator const std::string &() const noexcept { return m_data; }
-    operator std::string_view() const noexcept { return m_data; }
-
-    bool operator==(const SecureString &other) const noexcept { return m_data == other.m_data; }
-    bool operator==(const std::string &other) const noexcept { return m_data == other; }
-    bool operator==(std::string_view other) const noexcept { return m_data == other; }
-    bool operator==(const char *other) const noexcept { return m_data == (other ? other : ""); }
-
-    auto operator<=>(const SecureString &other) const noexcept { return m_data <=> other.m_data; }
-    auto operator<=>(const std::string &other) const noexcept { return m_data <=> other; }
-
-    friend std::string operator+(const SecureString &lhs, const std::string &rhs) { return lhs.m_data + rhs; }
-    friend std::string operator+(const std::string &lhs, const SecureString &rhs) { return lhs + rhs.m_data; }
-    friend std::string operator+(const SecureString &lhs, const SecureString &rhs) { return lhs.m_data + rhs.m_data; }
-    friend std::string operator+(const SecureString &lhs, const char *rhs) { return lhs.m_data + (rhs ? rhs : ""); }
-    friend std::string operator+(const char *lhs, const SecureString &rhs) { return (lhs ? lhs : "") + rhs.m_data; }
-
-private:
-    std::string m_data;
 };
 
-// JSON conversion functions for nlohmann::json
-inline void to_json(nlohmann::json &j, const SecureString &s)
-{
-    j = s.str();
-}
-
-inline void from_json(const nlohmann::json &j, SecureString &s)
-{
-    if (j.is_string())
-    {
-        s = j.get<std::string>();
-    }
-    else
-    {
-        s = "";
-    }
-}
-
-using SecureBuffer = SecureString;
+// Guard for a stable buffer: construct after its final allocation, never resize
+// or move that buffer while the guard is alive.
+class ScopedCleanse {
+public:
+    explicit ScopedCleanse(std::span<unsigned char> bytes) : bytes_(bytes) {}
+    explicit ScopedCleanse(std::string& text)
+        : bytes_(reinterpret_cast<unsigned char*>(text.data()), text.size()) {}
+    ~ScopedCleanse() { if (!bytes_.empty()) OPENSSL_cleanse(bytes_.data(), bytes_.size()); }
+    ScopedCleanse(const ScopedCleanse&) = delete;
+    ScopedCleanse& operator=(const ScopedCleanse&) = delete;
+private:
+    std::span<unsigned char> bytes_;
+};
