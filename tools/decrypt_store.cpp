@@ -55,7 +55,7 @@ void printHexDump(const unsigned char *data, size_t length, size_t maxDisplay = 
     }
     if (length > maxDisplay)
     {
-        std::cout << "       ... [" << std::dec << (length - maxDisplay) << " octets supplémentaires masqués]\n";
+        std::cout << "       ... [" << std::dec << (length - maxDisplay) << " additional bytes omitted]\n";
     }
 }
 
@@ -77,20 +77,20 @@ int main(int argc, char **argv)
 
     if (!std::filesystem::exists(vaultPath))
     {
-        std::cerr << "Erreur: Fichier introuvable: " << vaultPath << "\n";
+        std::cerr << "Error: File not found: " << vaultPath << "\n";
         return 1;
     }
 
     std::cout << "================================================================================\n";
-    std::cout << "                  ANODROP - INSPECTEUR DU JOURNAL CHIFFRÉ                       \n";
+    std::cout << "                  ANODROP - ENCRYPTED JOURNAL INSPECTOR                         \n";
     std::cout << "================================================================================\n";
-    std::cout << "Répertoire du store : " << storeDir << "\n\n";
+    std::cout << "Store directory: " << storeDir << "\n\n";
 
     // 1. Déverrouillage de vault.enc
     std::ifstream vaultFile(vaultPath, std::ios::binary);
     if (!vaultFile)
     {
-        std::cerr << "Erreur: Impossible d'ouvrir " << vaultPath << "\n";
+        std::cerr << "Error: Cannot open " << vaultPath << "\n";
         return 1;
     }
 
@@ -98,54 +98,54 @@ int main(int argc, char **argv)
         (std::istreambuf_iterator<char>(vaultFile)),
         std::istreambuf_iterator<char>());
 
-    std::cout << "--- [1] INSPECTION DU COFFRE (" << vaultPath.filename().string() << ") ---\n";
-    std::cout << "Taille du coffre : " << std::dec << vaultData.size() << " octets (attendu: 76 octets)\n";
+    std::cout << "--- [1] VAULT INSPECTION (" << vaultPath.filename().string() << ") ---\n";
+    std::cout << "Vault size: " << std::dec << vaultData.size() << " bytes (expected: 76 bytes)\n";
 
     if (vaultData.size() != 76)
     {
-        std::cerr << "Erreur: Taille de vault.enc invalide (doit être 76 octets)\n";
+        std::cerr << "Error: Invalid vault.enc size (must be exactly 76 bytes)\n";
         return 1;
     }
 
     const auto salt = std::vector<unsigned char>(vaultData.begin(), vaultData.begin() + 16);
     const auto encryptedDek = std::vector<unsigned char>(vaultData.begin() + 16, vaultData.end());
 
-    std::cout << "🔒 VUE CHIFFRÉE DU COFFRE (HEX) :\n";
-    std::cout << "   • Salt Argon2id (16 octets) : " << formatHex(salt.data(), salt.size()) << "\n";
-    std::cout << "   • IV Coffre (12 octets)     : " << formatHex(encryptedDek.data(), 12) << "\n";
-    std::cout << "   • DEK Chiffré (32 octets)   : " << formatHex(encryptedDek.data() + 12, 32) << "\n";
-    std::cout << "   • Tag GCM (16 octets)       : " << formatHex(encryptedDek.data() + 44, 16) << "\n";
+    std::cout << "🔒 ENCRYPTED VAULT VIEW (HEX):\n";
+    std::cout << "   • Argon2id Salt (16 bytes): " << formatHex(salt.data(), salt.size()) << "\n";
+    std::cout << "   • Vault IV (12 bytes)     : " << formatHex(encryptedDek.data(), 12) << "\n";
+    std::cout << "   • Encrypted DEK (32 bytes): " << formatHex(encryptedDek.data() + 12, 32) << "\n";
+    std::cout << "   • GCM Tag (16 bytes)      : " << formatHex(encryptedDek.data() + 44, 16) << "\n";
 
     std::vector<unsigned char> masterKey;
     try
     {
         auto kek = CryptoUtils::deriveStoreKey(masterPwd, salt);
-        std::cout << "\n🔑 CLÉ KEK DÉRIVÉE (Argon2id du mot de passe + salt) :\n";
-        std::cout << "   • KEK (32 octets / 256 bits) : " << formatHex(kek.data(), kek.size()) << "\n";
+        std::cout << "\n🔑 DERIVED KEK (Argon2id from password + salt):\n";
+        std::cout << "   • KEK (32 bytes / 256 bits): " << formatHex(kek.data(), kek.size()) << "\n";
 
         auto dekRes = CryptoUtils::decryptAES256GCM(encryptedDek, kek);
         OPENSSL_cleanse(kek.data(), kek.size());
 
         if (!dekRes)
         {
-            std::cerr << "\n❌ ÉCHEC : Mot de passe maître erroné ou vault corrompu.\n";
+            std::cerr << "\n❌ FAILURE: Incorrect master password or corrupted vault.\n";
             return 1;
         }
         masterKey = std::move(*dekRes);
-        std::cout << "\n🔓 VUE DÉCHIFFRÉE DU COFFRE (DEK / MASTERKEY) :\n";
-        std::cout << "   ✓ Mot de passe valide ! Déchiffrement réussi du DEK via KEK.\n";
-        std::cout << "   • DEK / MasterKey (HEX) : " << formatHex(masterKey.data(), masterKey.size()) << "\n\n";
+        std::cout << "\n🔓 DECRYPTED VAULT VIEW (DEK / MASTER KEY):\n";
+        std::cout << "   ✓ Master password valid! Successful DEK decryption via KEK.\n";
+        std::cout << "   • DEK / MasterKey (HEX)   : " << formatHex(masterKey.data(), masterKey.size()) << "\n\n";
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Erreur dérivation clé : " << e.what() << "\n";
+        std::cerr << "Key derivation error: " << e.what() << "\n";
         return 1;
     }
 
     // 2. Inspection et déchiffrement de transactions.v1.enc
     if (!std::filesystem::exists(journalPath))
     {
-        std::cout << "Aucun journal transactions.v1.enc trouvé.\n";
+        std::cout << "No transactions.v1.enc journal found.\n";
         OPENSSL_cleanse(masterKey.data(), masterKey.size());
         return 0;
     }
@@ -153,12 +153,12 @@ int main(int argc, char **argv)
     std::ifstream journalFile(journalPath, std::ios::binary);
     if (!journalFile)
     {
-        std::cerr << "Erreur: Impossible d'ouvrir " << journalPath << "\n";
+        std::cerr << "Error: Cannot open " << journalPath << "\n";
         OPENSSL_cleanse(masterKey.data(), masterKey.size());
         return 1;
     }
 
-    std::cout << "--- [2] DÉCORTICAGE DES ENREGISTREMENTS (" << journalPath.filename().string() << ") ---\n";
+    std::cout << "--- [2] JOURNAL RECORD PARSING (" << journalPath.filename().string() << ") ---\n";
 
     size_t recordIndex = 0;
     size_t fileOffset = 0;
@@ -177,19 +177,19 @@ int main(int argc, char **argv)
         std::vector<unsigned char> recordData(recordSize);
         if (!journalFile.read(reinterpret_cast<char *>(recordData.data()), recordSize))
         {
-            std::cerr << "⚠️ Fin de fichier inattendue (troncature détectée) à l'offset " << fileOffset << "\n";
+            std::cerr << "⚠️ Unexpected EOF (truncation detected) at offset " << fileOffset << "\n";
             break;
         }
 
         std::cout << "================================================================================\n";
         std::cout << "📦 TRANSACTION #" << std::dec << recordIndex
-                  << "  |  Offset Fichier: " << fileOffset << " (0x" << std::hex << fileOffset << std::dec << ")"
-                  << "  |  Taille: " << recordSize << " octets\n";
+                  << "  |  File Offset: " << fileOffset << " (0x" << std::hex << fileOffset << std::dec << ")"
+                  << "  |  Size: " << recordSize << " bytes\n";
         std::cout << "================================================================================\n";
 
         if (recordSize < 28) // 12 IV + 16 Tag
         {
-            std::cerr << "❌ Enregistrement trop court (inférieur à 28 octets minimum).\n";
+            std::cerr << "❌ Record too short (minimum 28 bytes required).\n";
             fileOffset += 4 + recordSize;
             ++recordIndex;
             continue;
@@ -202,36 +202,36 @@ int main(int argc, char **argv)
         const std::string aad = "AnoDropJournal/v1/" + std::to_string(recordIndex);
 
         // A. Affichage Chiffré en Hex / Décimal
-        std::cout << "🔒 1. VUE CHIFFRÉE SUR DISQUE (HEX & DÉCIMAL) :\n";
-        std::cout << "   • Préfixe Taille (4B LE) : " << recordSize << " octets [ " << formatHex(sizeBuf, 4) << "]\n";
-        std::cout << "   • IV Aléatoire (12B)     : [ " << formatHex(iv, 12) << "]\n";
-        std::cout << "   • Tag GCM Sceau (16B)    : [ " << formatHex(tag, 16) << "]\n";
-        std::cout << "   • AAD de Position        : \"" << aad << "\"\n";
-        std::cout << "   • Ciphertext (" << std::dec << ciphertextLen << " octets) :\n";
+        std::cout << "🔒 1. ENCRYPTED DISK VIEW (HEX & DECIMAL):\n";
+        std::cout << "   • Length Prefix (4B LE)  : " << recordSize << " bytes [ " << formatHex(sizeBuf, 4) << "]\n";
+        std::cout << "   • Random IV (12B)        : [ " << formatHex(iv, 12) << "]\n";
+        std::cout << "   • GCM Tag Seal (16B)     : [ " << formatHex(tag, 16) << "]\n";
+        std::cout << "   • Positional AAD         : \"" << aad << "\"\n";
+        std::cout << "   • Ciphertext (" << std::dec << ciphertextLen << " bytes):\n";
         printHexDump(ciphertext, ciphertextLen, 64);
 
         // B. Déchiffrement AES-256-GCM
         std::vector<unsigned char> aadBytes(aad.begin(), aad.end());
         auto decrypted = CryptoUtils::decryptAES256GCM(recordData, masterKey, aadBytes);
 
-        std::cout << "\n🔓 2. VUE DÉCHIFFRÉE (CONTENU EN CLAIR) :\n";
+        std::cout << "\n🔓 2. DECRYPTED VIEW (PLAINTEXT PAYLOAD):\n";
         if (decrypted)
         {
             std::string jsonStr(decrypted->begin(), decrypted->end());
             try
             {
                 auto j = nlohmann::json::parse(jsonStr);
-                std::cout << "   ✓ Authenticité validée par Tag AES-GCM !\n";
+                std::cout << "   ✓ Authenticity verified by AES-GCM tag!\n";
                 std::cout << j.dump(2) << "\n\n";
             }
             catch (const std::exception &)
             {
-                std::cout << "   ✓ Texte déchiffré (non-JSON) : " << jsonStr << "\n\n";
+                std::cout << "   ✓ Decrypted text (non-JSON): " << jsonStr << "\n\n";
             }
         }
         else
         {
-            std::cout << "   ❌ ÉCHEC D'AUTHENTIFICATION (Tag mismatch ou altération positionnelle) !\n\n";
+            std::cout << "   ❌ AUTHENTICATION FAILED (Tag mismatch or positional alteration)!\n\n";
         }
 
         fileOffset += 4 + recordSize;
@@ -239,8 +239,8 @@ int main(int argc, char **argv)
     }
 
     std::cout << "================================================================================\n";
-    std::cout << "Total transactions parcourues : " << std::dec << recordIndex << "\n";
-    std::cout << "Taille totale du journal      : " << fileOffset << " octets\n";
+    std::cout << "Total transactions parsed: " << std::dec << recordIndex << "\n";
+    std::cout << "Total journal size       : " << fileOffset << " bytes\n";
     std::cout << "================================================================================\n";
 
     OPENSSL_cleanse(masterKey.data(), masterKey.size());

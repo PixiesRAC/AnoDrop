@@ -2,7 +2,10 @@ build/
 compile_commands.json
 config.json
 config2.json
+store/
+store*/
 .vscode/
 .agent/
 *.log
 doc
+
