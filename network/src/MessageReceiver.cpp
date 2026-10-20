@@ -63,8 +63,13 @@ void MessageReceiver::receiveMessage(std::shared_ptr<LobbyObserver> lobby, std::
         SPDLOG_WARN("[MSG-IN] lobby={} seq={} | Message unavailable; retry on next cycle", nlohmann::json(data.metadata.lobby_name).dump(), sequence);
         return;
     }
-    auto message = network::DhtMessageCodec::parseChatMessage(result.value, sequence);
-    if (!message) { SPDLOG_WARN("[MSG-IN] lobby={} seq={} | Invalid message rejected", nlohmann::json(data.metadata.lobby_name).dump(), sequence); return; }
+    if (!data.crypto || data.crypto->my_x25519_priv.empty()) {
+        SPDLOG_WARN("[MSG-IN] lobby={} seq={} | Message ignored: local X25519 key unavailable", nlohmann::json(data.metadata.lobby_name).dump(), sequence);
+        return;
+    }
+    // DHT bodies are sealed to our X25519 public key; the plaintext is only materialized here.
+    auto message = network::DhtMessageCodec::openChatMessage(result.value, data.crypto->my_x25519_priv, sequence);
+    if (!message) { SPDLOG_WARN("[MSG-IN] lobby={} seq={} | Invalid or undecryptable message rejected", nlohmann::json(data.metadata.lobby_name).dump(), sequence); return; }
     if (data.sync.downloaded_seq_nums.acknowledges(static_cast<std::uint64_t>(sequence))) {
         SPDLOG_INFO("[MSG-IN] lobby={} seq={} | Message ignored: already received", nlohmann::json(data.metadata.lobby_name).dump(), sequence);
         return;

@@ -57,7 +57,7 @@ std::expected<std::int64_t, SendError> DhtChat::sendMessage(const std::string &m
             ChatMessage msg{MessageDirection::OUT, message,
                 TimeUtils::computeFakeTimestamp(state.metadata.fake_timezone.offset_seconds), state.sync.my_seq_num + 1};
             const auto payload = nlohmann::json(msg).dump();
-            if (!network::DhtMessageCodec::fitsBep44(payload)) {
+            if (!network::DhtMessageCodec::fitsBep44Sealed(payload.size())) {
                 result = std::unexpected(SendError::TooLarge); return update;
             }
             params.payload = payload;
@@ -65,6 +65,7 @@ std::expected<std::int64_t, SendError> DhtChat::sendMessage(const std::string &m
             params.targetSeqNum = msg.seq_num;
             params.sequenceTargetKey = state.crypto->private_node_discussion + state.crypto->my_x25519_pub;
             params.messageTargetKey = params.sequenceTargetKey + std::to_string(msg.seq_num);
+            params.recipientX25519Pub = state.crypto->announced_x25519_pub;
             update = lobby::prepare(state, lobby::StoreOutgoingMessage{msg});
             result = msg.seq_num;
             return update; });

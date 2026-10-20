@@ -31,6 +31,7 @@ using json = nlohmann::json;
 void reentrantSend(const std::filesystem::path& root);
 void outgoingCommands(const std::filesystem::path& root);
 void networkWorkflows(const std::filesystem::path& root);
+void sealedMessages();
 void handshakeSequenceContract(const std::filesystem::path &root, bool locallyReady, bool finalized);
 void handshakeRejectionContract(const std::filesystem::path &root);
 void check(bool condition, const std::string &message)
@@ -109,6 +110,7 @@ int main(int argc, char **argv)
         {"reentrant_send", [] { Temp t; reentrantSend(t.path); }},
         {"outgoing_commands", [] { Temp t; outgoingCommands(t.path); }},
         {"network_workflows", [] { Temp t; networkWorkflows(t.path); }},
+        {"sealed_messages", [] { sealedMessages(); }},
         {"transaction_contracts", [] {
             Temp t;
             LobbyStoreTestAccess store("pw", t.path.string());

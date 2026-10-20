@@ -62,4 +62,18 @@ struct X25519KeyPair
 [[nodiscard]] std::expected<X25519KeyPair, std::string> generateX25519KeyPair();
 
 [[nodiscard]] std::expected<std::vector<unsigned char>, std::string> deriveX25519SharedSecret(std::span<const unsigned char> myPrivateKey, std::span<const unsigned char> peerPublicKey);
+
+[[nodiscard]] std::expected<std::vector<unsigned char>, std::string> deriveX25519PublicKey(std::span<const unsigned char> privateKey);
+
+// Sealed box (ECIES): anonymous public-key encryption for a single recipient.
+// Wire format: [32B ephemeral X25519 public key][12B IV][AES-256-GCM ciphertext][16B tag].
+// Key = HKDF-SHA256(X25519(ephemeral_priv, recipient_pub), salt = ephemeral_pub || recipient_pub,
+//                   info = "AnoDrop/SealedBox/v1").
+// The ephemeral private key is wiped right after sealing, so only the holder of the recipient's
+// private key can open the box; the sender itself cannot decrypt what it sealed.
+inline constexpr std::size_t SEALED_BOX_OVERHEAD = 32 + 12 + 16;
+
+[[nodiscard]] std::expected<std::vector<unsigned char>, std::string> sealX25519(std::span<const unsigned char> plaintext, std::span<const unsigned char> recipientPublicKey, std::span<const unsigned char> aad = {});
+
+[[nodiscard]] std::expected<std::vector<unsigned char>, std::string> openX25519(std::span<const unsigned char> sealed, std::span<const unsigned char> recipientPrivateKey, std::span<const unsigned char> aad = {});
 } // namespace CryptoUtils

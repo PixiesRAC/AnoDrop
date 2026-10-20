@@ -2,6 +2,8 @@
 #include <future>
 
 #include "DhtChat.h"
+#include "CryptoUtils.h"
+#include "DhtMessageCodec.h"
 #include "DhtTransport.h"
 #include "HandshakeCoordinator.h"
 #include "LobbyDataSerializer.h"
@@ -22,6 +24,7 @@ struct FakeTransport final : DhtTransport
     };
     std::vector<Get> gets;
     std::vector<PutCompletion> puts;
+    std::vector<std::string> chatPayloads;
     int announcements = 0, handshakes = 0, anomalies = 0;
     bool accept = true, fail = false;
     bool fetchDhtItem(const std::string &, const std::string &, DhtItemCallback cb, DhtRequest request) override
@@ -39,8 +42,9 @@ struct FakeTransport final : DhtTransport
         puts.push_back(std::move(cb));
         return true;
     }
-    bool publishChatMessage(const ChatPublishParams &, PutCompletion cb = {}) override
+    bool publishChatMessage(const ChatPublishParams &params, PutCompletion cb = {}) override
     {
+        chatPayloads.push_back(params.payload);
         puts.push_back(std::move(cb));
         return true;
     }
@@ -72,15 +76,60 @@ void fence(PartitionedThreadPool &pool)
     check(future.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "Network executor stalled");
     future.get();
 }
+struct HexKeyPair
+{
+    std::string pub;
+    std::string priv;
+};
+HexKeyPair makeKeyPair()
+{
+    auto keys = CryptoUtils::generateX25519KeyPair();
+    check(keys.has_value(), "X25519 key generation failed");
+    return {Util::toHex(keys->publicKey), Util::toHex(keys->privateKey)};
+}
 } // namespace
+
+void sealedMessages()
+{
+    const auto bob = makeKeyPair();
+    const auto alice = makeKeyPair();
+    const std::string plaintext = nlohmann::json(ChatMessage{MessageDirection::OUT, "secret text", 1700000000, 7}).dump();
+
+    auto first = network::DhtMessageCodec::sealChatPayload(plaintext, bob.pub, 7);
+    auto second = network::DhtMessageCodec::sealChatPayload(plaintext, bob.pub, 7);
+    check(first && second, "Sealing a chat payload failed");
+    check(first->size() == plaintext.size() + CryptoUtils::SEALED_BOX_OVERHEAD, "Unexpected sealed-box overhead");
+    check(*first != *second, "Sealed boxes must use a fresh ephemeral key per message");
+    check(first->find("secret text") == std::string::npos, "Sealed payload leaks plaintext");
+
+    auto opened = network::DhtMessageCodec::openChatMessage(*first, bob.priv, 7);
+    check(opened && opened->content == "secret text" && opened->direction == MessageDirection::IN && opened->seq_num == 7,
+          "Recipient could not open the sealed payload");
+    check(!network::DhtMessageCodec::openChatMessage(*first, alice.priv, 7), "Sender or third party opened a sealed payload");
+    check(!network::DhtMessageCodec::openChatMessage(*first, bob.priv, 8), "Sealed payload accepted at another DHT slot");
+    check(!network::DhtMessageCodec::openChatMessage(plaintext, bob.priv, 7), "Plaintext DHT payload accepted");
+    auto tampered = *first;
+    tampered[tampered.size() / 2] ^= 0x01;
+    check(!network::DhtMessageCodec::openChatMessage(tampered, bob.priv, 7), "Tampered sealed payload accepted");
+    check(!network::DhtMessageCodec::sealChatPayload(plaintext, "", 7), "Sealing without a recipient key succeeded");
+    check(!network::DhtMessageCodec::sealChatPayload(plaintext, "zz", 7), "Sealing with a malformed recipient key succeeded");
+
+    // 936 B plaintext + 60 B overhead = 996 B, bencoded as "996:" + value = exactly 1000 B.
+    check(network::DhtMessageCodec::fitsBep44Sealed(936), "Sealed budget rejects the largest valid payload");
+    check(!network::DhtMessageCodec::fitsBep44Sealed(937), "Sealed budget ignores the sealed-box overhead");
+}
 
 void networkWorkflows(const std::filesystem::path &root)
 {
     LobbyStoreTestAccess store("pw", root.string());
+    const auto me = makeKeyPair();
+    const auto peer = makeKeyPair();
     LobbyUpdate initial;
     initial.status = LobbyStatus::HANDSHAKE_DONE;
     initial.private_node_discussion = "channel";
-    initial.announced_x25519_pub = "peer";
+    initial.my_x25519_pub = me.pub;
+    initial.my_x25519_priv = me.priv;
+    initial.announced_x25519_pub = peer.pub;
     store.commit("workflow", initial);
     auto lobby = store.getLobby("workflow");
     FakeTransport transport;
@@ -111,12 +160,21 @@ void networkWorkflows(const std::filesystem::path &root)
     check(transport.gets.back().request.kind == DhtFetchKind::Message, "Sequence did not schedule body");
     auto messageCallback = transport.gets.back().complete;
     ChatMessage message{MessageDirection::OUT, "incoming", TimeUtils::computeFakeTimestamp(0), 1};
-    auto payload = nlohmann::json(message).dump();
+    const auto plaintext = nlohmann::json(message).dump();
+    // Plaintext, foreign-key and wrong-slot bodies must never reach the journal.
+    messageCallback({DhtFetchStatus::Found, plaintext, 1});
+    messageCallback({DhtFetchStatus::Found, network::DhtMessageCodec::sealChatPayload(plaintext, peer.pub, 1).value(), 1});
+    messageCallback({DhtFetchStatus::Found, network::DhtMessageCodec::sealChatPayload(plaintext, me.pub, 2).value(), 1});
+    fence(pool);
+    check(lobby->historySize() == 0 && !lobby->getNetworkState().downloaded_seq_nums.acknowledges(1),
+          "Unsealed or misaddressed DHT body was accepted");
+    auto payload = network::DhtMessageCodec::sealChatPayload(plaintext, me.pub, 1).value();
     messageCallback({DhtFetchStatus::Found, payload, 1});
     messageCallback({DhtFetchStatus::Found, payload, 1});
     fence(pool);
     check(lobby->historySize() == 1 && lobby->getNetworkState().downloaded_seq_nums.acknowledges(1),
           "Duplicate callbacks duplicated the stored message");
+    check(lobby->historyPage(0, 1).at(0).content == "incoming", "Sealed body was not stored as plaintext");
     check(receiver.fetchLatestSequence(lobby), "Next sequence fetch rejected");
     auto late = transport.gets.back().complete;
     store.execute("workflow", lobby::SetVisibility{true});
@@ -132,7 +190,18 @@ void networkWorkflows(const std::filesystem::path &root)
     ChatPublishParams params;
     params.lobbyName = "workflow";
     params.targetSeqNum = 1;
+    params.payload = nlohmann::json(ChatMessage{MessageDirection::OUT, "outgoing", TimeUtils::computeFakeTimestamp(0), 1}).dump();
+    const auto putsBeforeUnsealable = transport.puts.size();
+    outbox.publishChatMessage(params); // No recipient key: must never fall back to a plaintext PUT.
+    check(transport.puts.size() == putsBeforeUnsealable, "Unsealable chat payload was published");
+    params.recipientX25519Pub = peer.pub;
     outbox.publishChatMessage(params);
+    check(transport.chatPayloads.back().find("outgoing") == std::string::npos, "Chat payload published in plaintext");
+    auto wire = network::DhtMessageCodec::openChatMessage(transport.chatPayloads.back(), peer.priv, 1);
+    check(wire && wire->content == "outgoing", "Peer could not open the published chat payload");
+    check(!network::DhtMessageCodec::openChatMessage(transport.chatPayloads.back(), me.priv, 1),
+          "Sender could open its own sealed chat payload");
+    check(store.getLobby("workflow")->historyPage(1, 1).at(0).content == "outgoing", "Journal lost the plaintext copy");
     transport.puts.back()(false);
     fence(pool);
     check(transport.announcements == 0 && !lobby->getNetworkState().dht_acked_seq_nums.acknowledges(1),

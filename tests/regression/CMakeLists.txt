@@ -24,7 +24,7 @@ add_executable(anodrop_regression
     ${PROJECT_SOURCE_DIR}/core/src/Config.cpp)
 target_include_directories(anodrop_regression PRIVATE $<TARGET_PROPERTY:AnoDrop,INCLUDE_DIRECTORIES>)
 target_link_libraries(anodrop_regression PRIVATE $<TARGET_PROPERTY:AnoDrop,LINK_LIBRARIES>)
-foreach(case reentrant_send transaction_contracts outgoing_commands network_workflows domain_commands statuses resync ack_gaps sequence_dedup json_roundtrip snapshot_schema persistence compaction compaction_pages password heartbeat terminal disk_reader checker_mutations log_analysis handshake_state handshake_rejections handshake_late_ready handshake_late_pending handshake_sequence_completion imported_config delivery_observation)
+foreach(case reentrant_send transaction_contracts outgoing_commands network_workflows sealed_messages domain_commands statuses resync ack_gaps sequence_dedup json_roundtrip snapshot_schema persistence compaction compaction_pages password heartbeat terminal disk_reader checker_mutations log_analysis handshake_state handshake_rejections handshake_late_ready handshake_late_pending handshake_sequence_completion imported_config delivery_observation)
     add_test(NAME regression.${case} COMMAND anodrop_regression ${case})
     set_tests_properties(regression.${case} PROPERTIES TIMEOUT 120 LABELS "regression;offline")
 endforeach()

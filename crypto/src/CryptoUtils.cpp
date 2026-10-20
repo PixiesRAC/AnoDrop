@@ -174,7 +174,8 @@ std::vector<unsigned char> deriveStoreKey(std::string_view password, std::span<c
     return output;
 }
 
-std::expected<X25519KeyPair, std::string> generateX25519KeyPair()
+// Key generation without logging: also used for per-message ephemeral keys (sealed boxes).
+static std::expected<X25519KeyPair, std::string> generateX25519KeyPairSilently()
 {
     PkeyCtxPtr pctx(EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, nullptr), EVP_PKEY_CTX_free);
     if (!pctx)
@@ -202,7 +203,14 @@ std::expected<X25519KeyPair, std::string> generateX25519KeyPair()
         return std::unexpected("Failed to extract raw X25519 keys");
     }
 
-    SPDLOG_INFO("[HANDSHAKE] generateX25519KeyPair: Raw generated PubKey: {}", Util::toHex(keyPair.publicKey));
+    return keyPair;
+}
+
+std::expected<X25519KeyPair, std::string> generateX25519KeyPair()
+{
+    auto keyPair = generateX25519KeyPairSilently();
+    if (keyPair)
+        SPDLOG_INFO("[HANDSHAKE] generateX25519KeyPair: Raw generated PubKey: {}", Util::toHex(keyPair->publicKey));
     return keyPair;
 }
 
@@ -295,6 +303,102 @@ std::expected<std::vector<unsigned char>, std::string> deriveHKDF(std::span<cons
 
     out.resize(len);
     return out;
+}
+
+std::expected<std::vector<unsigned char>, std::string> deriveX25519PublicKey(std::span<const unsigned char> privateKey)
+{
+    if (privateKey.size() != 32)
+        return std::unexpected("X25519 private key must be exactly 32 bytes");
+
+    PkeyPtr pkey(EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, privateKey.data(), privateKey.size()), EVP_PKEY_free);
+    if (!pkey)
+        return std::unexpected("Failed to load X25519 private key");
+
+    std::vector<unsigned char> publicKey(32);
+    size_t pubLen = publicKey.size();
+    if (EVP_PKEY_get_raw_public_key(pkey.get(), publicKey.data(), &pubLen) <= 0 || pubLen != 32)
+        return std::unexpected("Failed to derive X25519 public key");
+    return publicKey;
+}
+
+namespace
+{
+constexpr std::string_view SEALED_BOX_INFO = "AnoDrop/SealedBox/v1";
+constexpr std::size_t X25519_KEY_SIZE = 32;
+
+// Derives the AES-256-GCM key bound to both public keys of the exchange.
+std::expected<std::vector<unsigned char>, std::string> deriveSealedBoxKey(std::span<const unsigned char> sharedSecret,
+                                                                         std::span<const unsigned char> ephemeralPublicKey,
+                                                                         std::span<const unsigned char> recipientPublicKey)
+{
+    std::vector<unsigned char> salt;
+    salt.reserve(ephemeralPublicKey.size() + recipientPublicKey.size());
+    salt.insert(salt.end(), ephemeralPublicKey.begin(), ephemeralPublicKey.end());
+    salt.insert(salt.end(), recipientPublicKey.begin(), recipientPublicKey.end());
+    return deriveHKDF(sharedSecret, salt, SEALED_BOX_INFO, 32);
+}
+} // namespace
+
+std::expected<std::vector<unsigned char>, std::string> sealX25519(std::span<const unsigned char> plaintext, std::span<const unsigned char> recipientPublicKey, std::span<const unsigned char> aad)
+{
+    if (recipientPublicKey.size() != X25519_KEY_SIZE)
+        return std::unexpected("Recipient X25519 public key must be exactly 32 bytes");
+
+    // One-shot ephemeral key pair: its private half is wiped by ~X25519KeyPair when this function returns.
+    auto ephemeral = generateX25519KeyPairSilently();
+    if (!ephemeral)
+        return std::unexpected(ephemeral.error());
+
+    auto sharedRes = deriveX25519SharedSecret(ephemeral->privateKey, recipientPublicKey);
+    if (!sharedRes)
+        return std::unexpected(sharedRes.error());
+    auto shared = std::move(*sharedRes);
+    ScopedCleanse sharedGuard(shared);
+
+    auto keyRes = deriveSealedBoxKey(shared, ephemeral->publicKey, recipientPublicKey);
+    if (!keyRes)
+        return std::unexpected(keyRes.error());
+    auto key = std::move(*keyRes);
+    ScopedCleanse keyGuard(key);
+
+    auto encrypted = encryptAES256GCM(plaintext, key, aad);
+    if (!encrypted)
+        return std::unexpected(encrypted.error());
+
+    std::vector<unsigned char> sealed;
+    sealed.reserve(X25519_KEY_SIZE + encrypted->size());
+    sealed.insert(sealed.end(), ephemeral->publicKey.begin(), ephemeral->publicKey.end());
+    sealed.insert(sealed.end(), encrypted->begin(), encrypted->end());
+    return sealed;
+}
+
+std::expected<std::vector<unsigned char>, std::string> openX25519(std::span<const unsigned char> sealed, std::span<const unsigned char> recipientPrivateKey, std::span<const unsigned char> aad)
+{
+    if (sealed.size() < SEALED_BOX_OVERHEAD)
+        return std::unexpected("Sealed box is too small");
+    if (recipientPrivateKey.size() != X25519_KEY_SIZE)
+        return std::unexpected("Recipient X25519 private key must be exactly 32 bytes");
+
+    const auto ephemeralPublicKey = sealed.first(X25519_KEY_SIZE);
+    const auto ciphertext = sealed.subspan(X25519_KEY_SIZE);
+
+    auto recipientPublicKey = deriveX25519PublicKey(recipientPrivateKey);
+    if (!recipientPublicKey)
+        return std::unexpected(recipientPublicKey.error());
+
+    auto sharedRes = deriveX25519SharedSecret(recipientPrivateKey, ephemeralPublicKey);
+    if (!sharedRes)
+        return std::unexpected(sharedRes.error());
+    auto shared = std::move(*sharedRes);
+    ScopedCleanse sharedGuard(shared);
+
+    auto keyRes = deriveSealedBoxKey(shared, ephemeralPublicKey, *recipientPublicKey);
+    if (!keyRes)
+        return std::unexpected(keyRes.error());
+    auto key = std::move(*keyRes);
+    ScopedCleanse keyGuard(key);
+
+    return decryptAES256GCM(ciphertext, key, aad);
 }
 
 } // namespace CryptoUtils

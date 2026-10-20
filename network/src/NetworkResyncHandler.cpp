@@ -194,6 +194,7 @@ void NetworkResyncHandler::retryUnconfirmedMessages(std::shared_ptr<LobbyObserve
             params.targetSeqNum = msg.seq_num;
             params.sequenceTargetKey = data.crypto->private_node_discussion + data.crypto->my_x25519_pub;
             params.messageTargetKey = data.crypto->private_node_discussion + data.crypto->my_x25519_pub + std::to_string(msg.seq_num);
+            params.recipientX25519Pub = data.crypto->announced_x25519_pub;
 
             try
             {

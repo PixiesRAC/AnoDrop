@@ -266,7 +266,7 @@ Where `S` is the shared secret derived via X25519 ECDH ($S = \text{X25519}(K_{\t
 |---|---|---|---|
 | **Rendezvous Slot** | `ID(Channel_Passphrase)` | Domain Salt | AES-256-GCM encrypted 3-way handshake transcript |
 | **Sequence Announcement** | `ID(S + A_pub)` | None | Monotonic BEP 44 sequence number representing latest message $N$ |
-| **Message Payload $N$** | `ID(S + A_pub + N)` | `std::to_string(N)` | Encrypted message content, timestamp, and message ID |
+| **Message Payload $N$** | `ID(S + A_pub + N)` | `std::to_string(N)` | Sealed Box (ECIES): ephemeral X25519 + AES-256-GCM encrypted message payload |
 | **Monotonic ACK** | `ID(S + A_pub + "_ACK")` | `"ack"` | Compressed list of received sequence numbers (e.g. `"1-5,7"`) |
 | **Presence Heartbeat** | `ID(S + A_pub + "_HEARTBEAT_")` | `"heartbeat"` | Encrypted timestamp adjusted for agreed fake timezone |
 | **Anomaly Tombstone** | `ID(Channel_Passphrase)` | Domain Salt | Tamper alert published at `seq = INT64_MAX` replacing handshake |
@@ -465,11 +465,23 @@ sequenceDiagram
 
 #### Payload & DHT Item Structure
 
-##### 1. Encrypted Message Body
+##### 1. Sealed Message Body (ECIES on DHT)
 - **DHT Channel / Target**: `ID(S + A_pub + 7)`
 - **Salt**: `"7"` (string of `seq_num`)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `7` (authoritative message sequence `msg.seq_num`)
-- **Plaintext JSON Payload** (before AES-256-GCM encryption with channel key):
+- **Local Persistence**: Retained in plaintext JSON inside the local WAL journal `transactions.v1.enc` (which is already encrypted on disk by `EncryptedJournal` using AES-256-GCM via the Master Key).
+- **Wire Encryption (Sealed Box)**: Right before the DHT PUT, the payload is sealed using **ECIES**:
+  1. An ephemeral one-shot X25519 key pair $(E_{\text{priv}}, E_{\text{pub}})$ is generated.
+  2. The shared secret $S_{\text{box}} = \text{X25519}(E_{\text{priv}}, \text{Bob\_pub})$ is derived.
+  3. A 256-bit key is derived via $\text{HKDF-SHA256}(S_{\text{box}}, \text{salt} = E_{\text{pub}} \parallel \text{Bob\_pub}, \text{info} = \text{"AnoDrop/SealedBox/v1"})$.
+  4. The JSON payload is encrypted using **AES-256-GCM** with sequence-bound AAD `"AnoDropMessage/v1/7"`.
+  5. The ephemeral private key $E_{\text{priv}}$ is immediately wiped from memory (`OPENSSL_cleanse`).
+  6. **Sealed Guarantee**: Because $E_{\text{priv}}$ is destroyed and Alice does not have $\text{Bob\_priv}$, **even Alice cannot decrypt the network packet once sealed**. Only Bob can decrypt it using $\text{Bob\_priv}$.
+- **DHT Wire Binary Framing**:
+```text
+[ 32 Bytes Ephemeral X25519 PubKey ] [ 12 Bytes Random IV ] [ AES-256-GCM Ciphertext ] [ 16 Bytes GCM Tag ]
+```
+- **Decrypted Plaintext JSON View** (as materialized in memory by Bob upon receiving):
 ```json
 {
   "direction": 0,
