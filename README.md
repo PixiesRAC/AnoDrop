@@ -58,7 +58,7 @@ Traditional messengers (Signal, Telegram, WhatsApp, Matrix) rely on central rela
 
 - **Decentralized & Serverless**: Leverages the public BitTorrent DHT network. No proprietary relay servers, no centralized federation.
 - **Mutual Peer Confirmation Handshake**: Symmetric discovery with explicit mutual confirmations (`confirmed_peer`) and CSMA/CA-inspired adaptive timers, completely eliminating handshake split-brain and impersonation vulnerabilities.
-- **Outbox Architecture**: Payload-first replication guarantee (`fsync` to local WAL $\to$ PUT payload to DHT $\to$ wait for replication ACK $\to$ PUT sequence advance). Prevents retrieval race conditions where a peer sees a sequence bump before the message payload arrives at DHT replicas.
+- **Outbox Architecture**: Payload-first replication guarantee (`fsync` to local WAL → PUT payload to DHT → wait for replication ACK → PUT sequence advance). Prevents retrieval race conditions where a peer sees a sequence bump before the message payload arrives at DHT replicas.
 - **Strict Durability Before Visibility**: No state transition is visible in RAM before being authenticated and `fsync`ed to disk.
 - **Memory Hardening (`SecureString`)**: Plaintext message contents are encapsulated in `SecureString` and automatically wiped from RAM upon destruction via `OPENSSL_cleanse`.
 - **Authenticated WAL & Envelope Encryption**: Storage relies on `EncryptedJournal` (`transactions.v1.enc`), protected with inter-process `flock`, positional AAD (`"AnoDropJournal/v1/<index>"`), and AES-256-GCM. Master password rotations only re-encrypt the 32-byte DEK in `vault.enc` without re-writing message history.
@@ -76,6 +76,7 @@ Traditional messengers (Signal, Telegram, WhatsApp, Matrix) rely on central rela
 AnoDrop requires a Linux environment with a C++23 compliant compiler (`g++-13+` or `clang++-17+`), CMake, and the following libraries:
 
 #### Ubuntu / Debian (22.04+)
+
 ```bash
 sudo apt update
 sudo apt install -y \
@@ -90,11 +91,13 @@ sudo apt install -y \
 ```
 
 #### Arch Linux
+
 ```bash
 sudo pacman -S base-devel cmake libtorrent-rasterbar openssl ncurses spdlog nlohmann-json argon2
 ```
 
 #### Fedora (39+)
+
 ```bash
 sudo dnf install -y \
     gcc-c++ \
@@ -185,6 +188,7 @@ cp config.example.json config.json
 
 2. **Main Menu Navigation (`ui::GuiBuilder`)**:
    Once unlocked, AnoDrop presents a numbered interactive terminal menu:
+
    ```text
    === AnoDrop: Decentralized Messaging ===
    1. Handshake (Find new lobbies)
@@ -195,6 +199,7 @@ cp config.example.json config.json
 
    Use ARROWS to navigate, ENTER to select.
    ```
+
    - **`UP` / `DOWN`**: Move selection.
    - **`ENTER`**: Open the selected option.
    - **`q` / `Q`**: Exit the application.
@@ -209,7 +214,7 @@ cp config.example.json config.json
    - Lists all registered lobbies and their real-time state:
      - `[PENDING]`: 3-way handshake in progress on the DHT.
      - `[READY]`: Handshake completed (`HANDSHAKE_DONE`), mutual keys exchanged and verified.
-     - `[Connected]` / `[Disconnected]`: Peer presence status based on heartbeat freshness ($\le 300\text{s}$).
+     - `[Connected]` / `[Disconnected]`: Peer presence status based on heartbeat freshness (`<= 300 s`).
      - `* NEW MSG *`: Unread messages waiting in the lobby.
      - `[ERROR]`: Anomaly flagged (`LobbyStatus::ANOMALY`). Displays ` - Anomaly: <reason>` in red. Chat remains accessible and messages can still be exchanged.
    - **`UP` / `DOWN`**: Select a lobby.
@@ -239,7 +244,7 @@ cp config.example.json config.json
 | **Lobbies List** | `Enter` | Open chat for the selected lobby (when `[READY]`) |
 | **Lobbies List** | `d` / `Del` / `Backspace` | Forget / hide selected lobby |
 | **Lobbies List** | `q` / `Q` | Return to Main Menu |
-| **Chat View** | `Tab` | Cycle focus: Input box $\leftrightarrow$ `[ Leave Chat ]` $\leftrightarrow$ `[ Resync Pending ]` |
+| **Chat View** | `Tab` | Cycle focus: Input box ↔ `[ Leave Chat ]` ↔ `[ Resync Pending ]` |
 | **Chat View** | `Left` / `Right` | Toggle between `[ Leave Chat ]` and `[ Resync Pending ]` |
 | **Chat View** | `Up` / `Down` | Switch focus between input and buttons / scroll history |
 | **Chat View** | `PageUp` / `PageDown` | Fast scroll message history |
@@ -256,17 +261,21 @@ cp config.example.json config.json
 
 All communication occurs via mutable BEP 44 items. Target addresses are deterministically derived:
 
-$$\text{Seed} = \text{HKDF-SHA256}(\text{Input}, \text{info} = \text{"DHTSeed"})$$
-$$\text{KeyPair} = \text{Ed25519-From-Seed}(\text{Seed})$$
-$$\text{Target ID} = \text{SHA1}(\text{PublicKey}_{\text{Ed25519}} \parallel \text{Salt})$$
+```text
+Seed = HKDF-SHA256(Input, info = "DHTSeed")
+KeyPair = Ed25519-From-Seed(Seed)
+Target ID = SHA1(PublicKey_Ed25519 || Salt)
+```
 
-Where `S` is the shared secret derived via X25519 ECDH ($S = \text{X25519}(K_{\text{priv}}, K_{\text{pub}}^{\text{peer}})$), and `A_pub` / `B_pub` are the X25519 public keys.
+Here, `||` denotes byte concatenation.
+
+Where `S` is the shared secret derived via X25519 ECDH (`S = X25519(K_priv, K_peer_pub)`), and `A_pub` / `B_pub` are the X25519 public keys.
 
 | Channel / Item | Target Derivation | Salt | Payload & Purpose |
 |---|---|---|---|
 | **Rendezvous Slot** | `ID(Channel_Passphrase)` | Domain Salt | AES-256-GCM encrypted 3-way handshake transcript |
-| **Sequence Announcement** | `ID(S + A_pub)` | None | Monotonic BEP 44 sequence number representing latest message $N$ |
-| **Message Payload $N$** | `ID(S + A_pub + N)` | `std::to_string(N)` | Sealed Box (ECIES): ephemeral X25519 + AES-256-GCM encrypted message payload |
+| **Sequence Announcement** | `ID(S + A_pub)` | None | Monotonic BEP 44 sequence number representing latest message `N` |
+| **Message Payload `N`** | `ID(S + A_pub + N)` | `std::to_string(N)` | Sealed Box (ECIES): ephemeral X25519 + AES-256-GCM encrypted message payload |
 | **Monotonic ACK** | `ID(S + A_pub + "_ACK")` | `"ack"` | Compressed list of received sequence numbers (e.g. `"1-5,7"`) |
 | **Presence Heartbeat** | `ID(S + A_pub + "_HEARTBEAT_")` | `"heartbeat"` | Encrypted timestamp adjusted for agreed fake timezone |
 | **Anomaly Tombstone** | `ID(Channel_Passphrase)` | Domain Salt | Tamper alert published at `seq = INT64_MAX` replacing handshake |
@@ -277,9 +286,13 @@ Where `S` is the shared secret derived via X25519 ECDH ($S = \text{X25519}(K_{\t
 
 To prevent impersonation, split-brain states, and race conditions during simultaneous connections:
 1. **Symmetric Discovery**: Every handshake pass starts with a `GET` before deciding whether to `PUT`. Blind writes never occur.
-2. **Mutual Confirmation (`confirmed_peer`)**: Alice publishes $A_{\text{pub}}$. Bob reads $A_{\text{pub}}$ and publishes a record containing both keys with `confirmed_peer = A_pub`. Alice reads this, validates Bob, and publishes a finalized record with `confirmed_peer = B_pub`.
+2. **Mutual Confirmation (`confirmed_peer`)**: Alice publishes `A_pub`. Bob reads `A_pub` and publishes a record containing both keys with `confirmed_peer = A_pub`. Alice reads this, validates Bob, and publishes a finalized record with `confirmed_peer = B_pub`.
 3. **Adaptive CSMA/CA Delays**: If both clients write simultaneously, collisions are resolved using:
-   $$\text{Delay} = \text{BaseInterval} + \text{PubkeyOffset}(K_{\text{pub}}) + \text{RandomJitter}(0..20\text{s})$$
+
+   ```text
+   Delay = BaseInterval + PubkeyOffset(K_pub) + RandomJitter(0..20 s)
+   ```
+
 4. **Deterministic Timezone Tie-Break**: Whichever client has the lexicographically smaller Ed25519 public key dictates the synthetic timezone offset for heartbeat calculations.
 
 ---
@@ -289,10 +302,10 @@ To prevent impersonation, split-brain states, and race conditions during simulta
 Publishing the sequence number before the message payload causes a classic distributed systems race condition: a fast recipient notices the sequence bump, attempts to fetch the payload, and fails because DHT storage replicas have not received it yet.
 
 AnoDrop strictly enforces the **Outbox Pattern**:
-1. **Local WAL Append**: Message is assigned sequence $N$ and written to `transactions.v1.enc` with `fsync()`.
+1. **Local WAL Append**: Message is assigned sequence `N` and written to `transactions.v1.enc` with `fsync()`.
 2. **Payload Deposit**: Message body is published to `ID(S + A_pub + N)`.
 3. **Replication Confirmation**: The DHT engine waits for `dht_put_alert` confirmation from storage nodes.
-4. **Sequence Advancement**: Only then is the sequence counter at `ID(S + A_pub)` updated to $N$.
+4. **Sequence Advancement**: Only then is the sequence counter at `ID(S + A_pub)` updated to `N`.
 5. **Bounded Lookahead Planning**: The recipient's `ReceivePlanner` detects the sequence gap and fetches missing items up to `max_concurrent_fetches`, avoiding bandwidth spikes.
 
 ---
@@ -350,6 +363,7 @@ sequenceDiagram
 The payload stored in the rendezvous item is a JSON array of `PeerInfo` structs, encrypted with AES-256-GCM. Items are sorted canonically by `x25519_pub` to ensure deterministic ordering.
 
 ##### Step 1: Alice's Initial Offer (`PENDING_HANDSHAKE`)
+
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `1`
 - **DHT Target & Salt**: `ID(Channel_Passphrase)`, Salt = `Config salt`
 - Alice publishes only her own information. Her `confirmed_peer` is empty because she has not seen Bob yet:
@@ -370,9 +384,10 @@ The payload stored in the rendezvous item is a JSON array of `PeerInfo` structs,
 ```
 
 ##### Step 2: Bob's Merged Confirmation Offer (`CONFIRMATION_PENDING`)
+
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `2`
 - **DHT Target & Salt**: `ID(Channel_Passphrase)`, Salt = `Config salt`
-- Bob fetches Alice's record, derives the shared root $S = \text{X25519}(\text{Bob\_priv}, \text{Alice\_pub})$, and publishes a merged record where he explicitly confirms Alice's public key:
+- Bob fetches Alice's record, derives the shared root `S = X25519(Bob_priv, Alice_pub)`, and publishes a merged record where he explicitly confirms Alice's public key:
 
 ```json
 [
@@ -400,9 +415,10 @@ The payload stored in the rendezvous item is a JSON array of `PeerInfo` structs,
 ```
 
 ##### Step 3: Alice's Finalized Mutual Transcript (`HANDSHAKE_DONE`)
+
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `9223372036854775806` (`INT64_MAX - 1`)
 - **DHT Target & Salt**: `ID(Channel_Passphrase)`, Salt = `Config salt`
-- Alice fetches Bob's offer, verifies that Bob confirmed her key (`confirmed_peer == Alice_pub`), derives the same root $S$, sets her own `confirmed_peer = Bob_pub`, harmonizes the fake timezone (the lexicographically smaller public key wins), and writes the finalized transcript at sequence `INT64_MAX - 1`:
+- Alice fetches Bob's offer, verifies that Bob confirmed her key (`confirmed_peer == Alice_pub`), derives the same root `S`, sets her own `confirmed_peer = Bob_pub`, harmonizes the fake timezone (the lexicographically smaller public key wins), and writes the finalized transcript at sequence `INT64_MAX - 1`:
 
 ```json
 [
@@ -429,7 +445,8 @@ The payload stored in the rendezvous item is a JSON array of `PeerInfo` structs,
 ]
 ```
 
-##### Step 4: Bob Confirms Finalized State (`HANDSHAKE_DONE` $\to$ `[READY]`)
+##### Step 4: Bob Confirms Finalized State (`HANDSHAKE_DONE` → `[READY]`)
+
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: Verifies received `dht_seq == 9223372036854775806` (`INT64_MAX - 1`)
 - Bob polls `ID(Channel_Passphrase)`, verifies that both participants have mutually confirmed each other (`ourConfirmationPresent && peer.confirmed_peer == Bob_pub`), and marks the lobby as `[READY]`. Both clients cease polling the rendezvous slot and transition to conversation-specific channels.
 
@@ -466,22 +483,27 @@ sequenceDiagram
 #### Payload & DHT Item Structure
 
 ##### 1. Sealed Message Body (ECIES on DHT)
+
 - **DHT Channel / Target**: `ID(S + A_pub + 7)`
 - **Salt**: `"7"` (string of `seq_num`)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `7` (authoritative message sequence `msg.seq_num`)
 - **Local Persistence**: Retained in plaintext JSON inside the local WAL journal `transactions.v1.enc` (which is already encrypted on disk by `EncryptedJournal` using AES-256-GCM via the Master Key).
 - **Wire Encryption (Sealed Box)**: Right before the DHT PUT, the payload is sealed using **ECIES**:
-  1. An ephemeral one-shot X25519 key pair $(E_{\text{priv}}, E_{\text{pub}})$ is generated.
-  2. The shared secret $S_{\text{box}} = \text{X25519}(E_{\text{priv}}, \text{Bob\_pub})$ is derived.
-  3. A 256-bit key is derived via $\text{HKDF-SHA256}(S_{\text{box}}, \text{salt} = E_{\text{pub}} \parallel \text{Bob\_pub}, \text{info} = \text{"AnoDrop/SealedBox/v1"})$.
+
+  1. An ephemeral one-shot X25519 key pair `(E_priv, E_pub)` is generated.
+  2. The shared secret `S_box = X25519(E_priv, Bob_pub)` is derived.
+  3. A 256-bit key is derived via `HKDF-SHA256(S_box, salt = E_pub || Bob_pub, info = "AnoDrop/SealedBox/v1")`.
   4. The JSON payload is encrypted using **AES-256-GCM** with sequence-bound AAD `"AnoDropMessage/v1/7"`.
-  5. The ephemeral private key $E_{\text{priv}}$ is immediately wiped from memory (`OPENSSL_cleanse`).
-  6. **Sealed Guarantee**: Because $E_{\text{priv}}$ is destroyed and Alice does not have $\text{Bob\_priv}$, **even Alice cannot decrypt the network packet once sealed**. Only Bob can decrypt it using $\text{Bob\_priv}$.
+  5. The ephemeral private key `E_priv` is immediately wiped from memory (`OPENSSL_cleanse`).
+  6. **Sealed Guarantee**: Because `E_priv` is destroyed and Alice does not have `Bob_priv`, **even Alice cannot decrypt the network packet once sealed**. Only Bob can decrypt it using `Bob_priv`.
 - **DHT Wire Binary Framing**:
+
 ```text
 [ 32 Bytes Ephemeral X25519 PubKey ] [ 12 Bytes Random IV ] [ AES-256-GCM Ciphertext ] [ 16 Bytes GCM Tag ]
 ```
+
 - **Decrypted Plaintext JSON View** (as materialized in memory by Bob upon receiving):
+
 ```json
 {
   "direction": 0,
@@ -492,10 +514,12 @@ sequenceDiagram
 ```
 
 ##### 2. Sequence Progress Announcement
+
 - **DHT Channel / Target**: `ID(S + A_pub)`
 - **Salt**: `""` (no salt)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `7` (tracks highest confirmed published sequence)
 - **Plaintext Payload**:
+
 ```text
 "7"
 ```
@@ -537,20 +561,25 @@ sequenceDiagram
 #### Payload & DHT Item Structure
 
 ##### 1. Compressed Selective ACK on DHT
+
 - **DHT Channel / Target**: `ID(S + B_pub + "_ACK")`
 - **Salt**: `"ack"`
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `1774001500` (timestamp-based monotonic sequence: `targetSeq = fakeTimestamp > current_dht_seq ? fakeTimestamp : current_dht_seq + 1`)
 - **Payload**:
+
 ```text
 "1-5,7"
 ```
+
 > **Meaning:** Bob has persistently stored messages 1 to 5 and message 7. Message 6 is the missing gap.
 
 ##### 2. Automatic Outbox Retransmission (Republish Missing Slot)
+
 - **DHT Channel / Target**: `ID(S + A_pub + 6)`
 - **Salt**: `"6"`
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `6` (`NetworkResyncHandler` republishes the unconfirmed slot)
 - **Plaintext JSON Payload**:
+
 ```json
 {
   "direction": 0,
@@ -561,10 +590,12 @@ sequenceDiagram
 ```
 
 ##### 3. Manual Resync Message Payload (Triggered via `[ Resync Pending ]`)
+
 - **DHT Channel / Target**: `ID(S + A_pub + 8)`
 - **Salt**: `"8"`
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `8` (assigned by `DhtChat::sendMessage` as `my_seq_num + 1`)
 - **Plaintext JSON Payload**:
+
 ```json
 {
   "direction": 0,
@@ -575,10 +606,12 @@ sequenceDiagram
 ```
 
 ##### 4. Sequence Announcement after Manual Resync
+
 - **DHT Channel / Target**: `ID(S + A_pub)`
 - **Salt**: `""`
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `8`
 - **Plaintext Payload**:
+
 ```text
 "8"
 ```
@@ -607,14 +640,17 @@ sequenceDiagram
 #### Payload & DHT Item Structure
 
 ##### Heartbeat Record
+
 - **DHT Channel / Target**: `ID(S + A_pub + "_HEARTBEAT_")`
 - **Salt**: `"heartbeat"`
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `1774001800` (timestamp-based monotonic seq: `fakeTimestamp > current_dht_seq ? fakeTimestamp : current_dht_seq + 1`)
 - **Payload**: Obfuscated Unix timestamp string
+
 ```text
 "1774001800"
 ```
-> **Online Evaluation:** Bob evaluates $|t_{\text{peer\_now}} - t_{\text{heartbeat}}| \le 300\text{s}$. If within 5 minutes, status displays `[Connected]`; otherwise `[Disconnected]`.
+
+> **Online Evaluation:** Bob evaluates `abs(t_peer_now - t_heartbeat) <= 300 s`. If within 5 minutes, status displays `[Connected]`; otherwise `[Disconnected]`.
 
 ---
 
@@ -643,16 +679,19 @@ sequenceDiagram
 #### Payload & DHT Item Structure
 
 ##### Emergency Anomaly Tombstone
+
 - **DHT Channel / Target**: `ID(Channel_Passphrase)` (rendezvous slot)
 - **Salt**: `Config salt` (default: `"anodrop_handshake"`)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `9223372036854775807` (`INT64_MAX`, the maximum possible 64-bit integer)
 - **Plaintext JSON Payload** (before AES-256-GCM encryption with channel key):
+
 ```json
 {
   "anomaly": true,
   "message": "Corrupted timestamp received from peer"
 }
 ```
+
 > **Irreversibility Guarantee:** In BitTorrent BEP 44, nodes accept updates only if `new_seq > old_seq`. Because `INT64_MAX` is the absolute upper bound, no subsequent write can ever overwrite this slot. The rendezvous channel is permanently poisoned and flagged as compromised.
 
 ---
@@ -688,14 +727,18 @@ sequenceDiagram
 #### Storage Record & On-Disk Binary Structure
 
 ##### 1. Binary On-Disk Envelope (`store/transactions.v1.enc`)
+
 - **Storage Layer**: Local Disk Journal (managed by `IoWorker` via single-writer thread)
 - **Record Framing**:
+
 ```text
 [ 4 Bytes LE Payload Length ] [ 12 Bytes Random IV ] [ AES-256-GCM Ciphertext ] [ 16 Bytes GCM Tag ]
 ```
+
 - **Positional Authenticated Additional Data (AAD)**: `"AnoDropJournal/v1/<record_index>"` (e.g., `"AnoDropJournal/v1/0"`, `"AnoDropJournal/v1/1"`, preventing transposition or truncation attacks).
 
 ##### 2. Decrypted Plaintext Transaction Payload (JSON `LobbyUpdate`)
+
 ```json
 {
   "version": 1,
