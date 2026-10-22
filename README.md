@@ -162,7 +162,7 @@ cp config.example.json config.json
 | `fetch_interval_ms` | Interval (in ms) between background DHT polling cycles (default: `5000`). |
 | `argon2_iterations` | Computational cost for Argon2id key derivation (default: `5`). |
 | `max_concurrent_fetches` | Maximum parallel DHT `get` queries in flight (default: `16`). |
-| `extra_salt_data_for_lobby_handshake` | Shared domain salt. All communicating parties must use identical values. |
+| `extra_salt_data_for_lobby_handshake` | Extra domain value included in the serialized Argon2id salt parameters (default: `"AnoDrop"`). All communicating parties must use identical values; this string is not itself the BEP 44 salt. |
 | `log_level` | Logger verbosity: `trace`, `debug`, `info`, `warn`, `err`, `critical`, `off`. |
 | `network_interface` | Kill-switch binding: `"any"` (default) or network device name (e.g., `"tun0"`, `"wg0"`). |
 
@@ -262,23 +262,31 @@ cp config.example.json config.json
 All communication occurs via mutable BEP 44 items. Target addresses are deterministically derived:
 
 ```text
-Seed = HKDF-SHA256(Input, info = "DHTSeed")
+Argon2Salt = Serialize(SaltParams(extraValue = config.extra_salt_data_for_lobby_handshake))
+LobbySalt = Argon2id(Channel_Passphrase, salt = Argon2Salt,
+                    iterations = config.argon2_iterations,
+                    memory = 65536 KiB, parallelism = 1, output = 32 bytes)
+Seed = HKDF-SHA256(Input, salt = empty, info = "DHTSeed", output = 32 bytes)
 KeyPair = Ed25519-From-Seed(Seed)
-Target ID = SHA1(PublicKey_Ed25519 || Salt)
+Target ID = SHA1(PublicKey_Ed25519 || LobbySalt)
 ```
 
 Here, `||` denotes byte concatenation.
 
+**Every record in the same lobby uses the same 32-byte `LobbySalt` as its BEP 44 salt.** `Argon2Salt` is the input salt to Argon2id; `LobbySalt` is its output. The serialized input includes the version, domain ID, key purpose, epoch marker, and configured extra value. Both peers must use matching derivation parameters, including `argon2_iterations` (default: `5`). The raw `LobbySalt` bytes are used for the target hash and passed to DHT GET and PUT operations.
+
+The message number and the `_ACK` / `_HEARTBEAT_` suffixes belong to `Input`, which determines the Ed25519 key pair. They are not separate BEP 44 salts. Implementation: [SaltParams](crypto/include/SaltParams.h), [Hasher](crypto/include/Hasher.h), [DhtAddress](network/include/DhtAddress.h), and [HandshakeKeyService](crypto/src/HandshakeKeyService.cpp).
+
 Where `S` is the shared secret derived via X25519 ECDH (`S = X25519(K_priv, K_peer_pub)`), and `A_pub` / `B_pub` are the X25519 public keys.
 
-| Channel / Item | Target Derivation | Salt | Payload & Purpose |
+| Channel / Item | Target Derivation | BEP 44 Salt | Payload & Purpose |
 |---|---|---|---|
-| **Rendezvous Slot** | `ID(Channel_Passphrase)` | Domain Salt | AES-256-GCM encrypted 3-way handshake transcript |
-| **Sequence Announcement** | `ID(S + A_pub)` | None | Monotonic BEP 44 sequence number representing latest message `N` |
-| **Message Payload `N`** | `ID(S + A_pub + N)` | `std::to_string(N)` | Sealed Box (ECIES): ephemeral X25519 + AES-256-GCM encrypted message payload |
-| **Monotonic ACK** | `ID(S + A_pub + "_ACK")` | `"ack"` | Compressed list of received sequence numbers (e.g. `"1-5,7"`) |
-| **Presence Heartbeat** | `ID(S + A_pub + "_HEARTBEAT_")` | `"heartbeat"` | Encrypted timestamp adjusted for agreed fake timezone |
-| **Anomaly Tombstone** | `ID(Channel_Passphrase)` | Domain Salt | Tamper alert published at `seq = INT64_MAX` replacing handshake |
+| **Rendezvous Slot** | `ID(Channel_Passphrase)` | `LobbySalt` | AES-256-GCM encrypted 3-way handshake transcript |
+| **Sequence Announcement** | `ID(S + A_pub)` | `LobbySalt` | Signed plaintext decimal `N` announcing the latest published message; BEP 44 sequence number is also `N` |
+| **Message Payload `N`** | `ID(S + A_pub + N)` | `LobbySalt` | Sealed Box (ECIES): ephemeral X25519 + AES-256-GCM encrypted message payload |
+| **Monotonic ACK** | `ID(S + A_pub + "_ACK")` | `LobbySalt` | Signed plaintext cumulative receipt followed by selective message numbers (e.g. `"5,7"`: Alice saved Bob's messages through 5, plus 7) |
+| **Presence Heartbeat** | `ID(S + A_pub + "_HEARTBEAT_")` | `LobbySalt` | Signed plaintext timestamp adjusted for the agreed fake timezone |
+| **Anomaly Tombstone** | `ID(Channel_Passphrase)` | `LobbySalt` | Tamper alert published at `seq = INT64_MAX` replacing handshake |
 
 ---
 
@@ -365,7 +373,7 @@ The payload stored in the rendezvous item is a JSON array of `PeerInfo` structs,
 ##### Step 1: Alice's Initial Offer (`PENDING_HANDSHAKE`)
 
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `1`
-- **DHT Target & Salt**: `ID(Channel_Passphrase)`, Salt = `Config salt`
+- **DHT Target & Salt**: `ID(Channel_Passphrase)`, BEP 44 salt = `LobbySalt` (32 bytes derived from the lobby)
 - Alice publishes only her own information. Her `confirmed_peer` is empty because she has not seen Bob yet:
 
 ```json
@@ -386,7 +394,7 @@ The payload stored in the rendezvous item is a JSON array of `PeerInfo` structs,
 ##### Step 2: Bob's Merged Confirmation Offer (`CONFIRMATION_PENDING`)
 
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `2`
-- **DHT Target & Salt**: `ID(Channel_Passphrase)`, Salt = `Config salt`
+- **DHT Target & Salt**: `ID(Channel_Passphrase)`, BEP 44 salt = `LobbySalt` (32 bytes derived from the lobby)
 - Bob fetches Alice's record, derives the shared root `S = X25519(Bob_priv, Alice_pub)`, and publishes a merged record where he explicitly confirms Alice's public key:
 
 ```json
@@ -417,7 +425,7 @@ The payload stored in the rendezvous item is a JSON array of `PeerInfo` structs,
 ##### Step 3: Alice's Finalized Mutual Transcript (`HANDSHAKE_DONE`)
 
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `9223372036854775806` (`INT64_MAX - 1`)
-- **DHT Target & Salt**: `ID(Channel_Passphrase)`, Salt = `Config salt`
+- **DHT Target & Salt**: `ID(Channel_Passphrase)`, BEP 44 salt = `LobbySalt` (32 bytes derived from the lobby)
 - Alice fetches Bob's offer, verifies that Bob confirmed her key (`confirmed_peer == Alice_pub`), derives the same root `S`, sets her own `confirmed_peer = Bob_pub`, harmonizes the fake timezone (the lexicographically smaller public key wins), and writes the finalized transcript at sequence `INT64_MAX - 1`:
 
 ```json
@@ -485,7 +493,7 @@ sequenceDiagram
 ##### 1. Sealed Message Body (ECIES on DHT)
 
 - **DHT Channel / Target**: `ID(S + A_pub + 7)`
-- **Salt**: `"7"` (string of `seq_num`)
+- **BEP 44 Salt**: `LobbySalt` (32 bytes derived from the lobby)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `7` (authoritative message sequence `msg.seq_num`)
 - **Local Persistence**: Retained in plaintext JSON inside the local WAL journal `transactions.v1.enc` (which is already encrypted on disk by `EncryptedJournal` using AES-256-GCM via the Master Key).
 - **Wire Encryption (Sealed Box)**: Right before the DHT PUT, the payload is sealed using **ECIES**:
@@ -516,7 +524,7 @@ sequenceDiagram
 ##### 2. Sequence Progress Announcement
 
 - **DHT Channel / Target**: `ID(S + A_pub)`
-- **Salt**: `""` (no salt)
+- **BEP 44 Salt**: `LobbySalt` (32 bytes derived from the lobby)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `7` (tracks highest confirmed published sequence)
 - **Plaintext Payload**:
 
@@ -531,7 +539,7 @@ sequenceDiagram
 > **Use Case & Context:**  
 > Alice has sent messages 1 through 7, but due to UDP packet loss or DHT churn, message 6 never reached Bob's local store. Bob has successfully received and saved messages 1 through 5, as well as message 7.  
 > **Problem Solved:**  
-> Cumulative single-number ACKs (such as TCP ACK 6) would force retransmissions of subsequent messages that Bob already received. AnoDrop uses compressed selective ACK ranges (`"1-5,7"`), allowing Alice's `NetworkResyncHandler` (or the user pressing `[ Resync Pending ]`) to pinpoint and retransmit only the missing gap (message 6) without redundant transfers.
+> A cumulative receipt alone cannot report that message 7 arrived while message 6 is missing. AnoDrop encodes a cumulative receipt followed by selective message numbers (`"5,7"`: all messages through 5, plus 7), allowing Alice's `NetworkResyncHandler` (or the user pressing `[ Resync Pending ]`) to identify unacknowledged messages for retransmission.
 
 ```mermaid
 sequenceDiagram
@@ -541,9 +549,9 @@ sequenceDiagram
     participant Q as DHT Alice SeqNum<br/>ID(S + A_pub)
     participant K as DHT Bob ACK<br/>ID(S + B_pub + ACK)
     participant B as Bob
-    Note over A,B: Bob sent ACK "1-5,7" -- message 6 was lost in transit
+    Note over A,B: Bob sent ACK "5,7" -- message 6 was lost in transit
     A->>K: GET Bob's ACK entry
-    K-->>A: Bob ACK is "1-5,7" (sequence 6 missing)
+    K-->>A: Bob ACK is "5,7" (sequence 6 missing)
     A->>M: Outbox retry: republish message 6 at ID(S + A_pub + 6) (dht_seq = 6)
     M-->>A: DHT confirmation refreshed
     A->>Q: Refresh sequence announcement for 7 (dht_seq = 7)
@@ -553,7 +561,7 @@ sequenceDiagram
     B->>M: Retry GET for missing message 6
     M-->>B: Encrypted message 6
     B->>B: Save only if not already in downloaded_seq_nums
-    B->>K: PUT updated ACK "1-7" (dht_seq = timestamp)
+    B->>K: PUT updated ACK "7" (dht_seq = timestamp)
     A->>K: GET updated ACK
     K-->>A: Receipt of 1-7 confirmed (Stop retrying 6)
 ```
@@ -563,20 +571,20 @@ sequenceDiagram
 ##### 1. Compressed Selective ACK on DHT
 
 - **DHT Channel / Target**: `ID(S + B_pub + "_ACK")`
-- **Salt**: `"ack"`
+- **BEP 44 Salt**: `LobbySalt` (32 bytes derived from the lobby)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `1774001500` (timestamp-based monotonic sequence: `targetSeq = fakeTimestamp > current_dht_seq ? fakeTimestamp : current_dht_seq + 1`)
-- **Payload**:
+- **Payload** (signed plaintext):
 
 ```text
-"1-5,7"
+"5,7"
 ```
 
-> **Meaning:** Bob has persistently stored messages 1 to 5 and message 7. Message 6 is the missing gap.
+> **Meaning:** The first number is the cumulative receipt: Bob has persistently stored all messages through 5. Subsequent numbers identify additional stored messages, here 7. Message 6 is the missing gap. Once 6 is stored, the receipt becomes `"7"`.
 
 ##### 2. Automatic Outbox Retransmission (Republish Missing Slot)
 
 - **DHT Channel / Target**: `ID(S + A_pub + 6)`
-- **Salt**: `"6"`
+- **BEP 44 Salt**: `LobbySalt` (32 bytes derived from the lobby)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `6` (`NetworkResyncHandler` republishes the unconfirmed slot)
 - **Plaintext JSON Payload**:
 
@@ -592,7 +600,7 @@ sequenceDiagram
 ##### 3. Manual Resync Message Payload (Triggered via `[ Resync Pending ]`)
 
 - **DHT Channel / Target**: `ID(S + A_pub + 8)`
-- **Salt**: `"8"`
+- **BEP 44 Salt**: `LobbySalt` (32 bytes derived from the lobby)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `8` (assigned by `DhtChat::sendMessage` as `my_seq_num + 1`)
 - **Plaintext JSON Payload**:
 
@@ -608,7 +616,7 @@ sequenceDiagram
 ##### 4. Sequence Announcement after Manual Resync
 
 - **DHT Channel / Target**: `ID(S + A_pub)`
-- **Salt**: `""`
+- **BEP 44 Salt**: `LobbySalt` (32 bytes derived from the lobby)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `8`
 - **Plaintext Payload**:
 
@@ -642,9 +650,9 @@ sequenceDiagram
 ##### Heartbeat Record
 
 - **DHT Channel / Target**: `ID(S + A_pub + "_HEARTBEAT_")`
-- **Salt**: `"heartbeat"`
+- **BEP 44 Salt**: `LobbySalt` (32 bytes derived from the lobby)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `1774001800` (timestamp-based monotonic seq: `fakeTimestamp > current_dht_seq ? fakeTimestamp : current_dht_seq + 1`)
-- **Payload**: Obfuscated Unix timestamp string
+- **Payload**: Signed plaintext Unix timestamp string, adjusted for the agreed fake timezone; the timestamp is not encrypted.
 
 ```text
 "1774001800"
@@ -681,7 +689,7 @@ sequenceDiagram
 ##### Emergency Anomaly Tombstone
 
 - **DHT Channel / Target**: `ID(Channel_Passphrase)` (rendezvous slot)
-- **Salt**: `Config salt` (default: `"anodrop_handshake"`)
+- **BEP 44 Salt**: `LobbySalt` (32 bytes derived from the lobby)
 - **BEP 44 DHT Sequence Number (`dht_seq`)**: `9223372036854775807` (`INT64_MAX`, the maximum possible 64-bit integer)
 - **Plaintext JSON Payload** (before AES-256-GCM encryption with channel key):
 
