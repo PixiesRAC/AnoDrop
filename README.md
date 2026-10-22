@@ -61,7 +61,7 @@ Traditional messengers (Signal, Telegram, WhatsApp, Matrix) rely on central rela
 - **Outbox Architecture**: Payload-first replication guarantee (`fsync` to local WAL → PUT payload to DHT → wait for replication ACK → PUT sequence advance). Prevents retrieval race conditions where a peer sees a sequence bump before the message payload arrives at DHT replicas.
 - **Strict Durability Before Visibility**: No state transition is visible in RAM before being authenticated and `fsync`ed to disk.
 - **Memory Hardening (`SecureString`)**: Plaintext message contents are encapsulated in `SecureString` and automatically wiped from RAM upon destruction via `OPENSSL_cleanse`.
-- **Authenticated WAL & Envelope Encryption**: Storage relies on `EncryptedJournal` (`transactions.v1.enc`), protected with inter-process `flock`, positional AAD (`"AnoDropJournal/v1/<index>"`), and AES-256-GCM. Master password rotations only re-encrypt the 32-byte DEK in `vault.enc` without re-writing message history.
+- **Authenticated WAL & Envelope Encryption**: Storage relies on `EncryptedJournal` (`transactions.v1.enc`), protected with inter-process `flock`, positional AAD (`"AnoDropJournal/v1/<index>"`), and AES-256-GCM. The master password derives a Key Encryption Key (KEK) via Argon2id to unwrap the DEK in `vault.enc`. Master password rotations only re-encrypt the 32-byte DEK in `vault.enc` without re-writing message history.
 - **Atomic Compaction**: Obsolete intermediate state transactions are consolidated in the background into single-pass snapshots via atomic file replacement (`rename` + directory `fsync`), eliminating disk bloat.
 - **Metadata & Timezone Privacy**: Presence heartbeats use negotiated synthetic timezone offsets, hiding the user's real geographic location and IP time offsets.
 - **Hardware/Interface Kill-Switch**: Configurable exclusive binding to specific VPN or WireGuard network interfaces (`wg0`, `tun0`, `nordlynx`).
@@ -183,8 +183,8 @@ cp config.example.json config.json
 ### First Launch & TUI Controls
 
 1. **Master Password Prompt (`ui::Unlock`)**:
-   - On the very first run, enter a strong master password to initialize the encrypted vault (`vault.enc`).
-   - On subsequent runs, enter the master password to unlock the Data Encryption Key (DEK) and replay the encrypted journal (`transactions.v1.enc`).
+   - On the very first run, enter a strong master password to initialize the encrypted vault (`vault.enc`). The master password derives a Key Encryption Key (KEK) via Argon2id to wrap the Data Encryption Key (DEK).
+   - On subsequent runs, enter the master password to derive the KEK via Argon2id, unwrap the DEK in `vault.enc`, and replay the encrypted journal (`transactions.v1.enc`).
 
 2. **Main Menu Navigation (`ui::GuiBuilder`)**:
    Once unlocked, AnoDrop presents a numbered interactive terminal menu:
@@ -709,7 +709,7 @@ sequenceDiagram
 > **Use Case & Context:**  
 > AnoDrop must store private messages, ratchet states, and lobby metadata locally on disk without ever leaking plaintext to unencrypted disk sectors or risking database corruption on sudden power loss or process kill.  
 > **Problem Solved:**  
-> Traditional SQLite or flat files risk data corruption during interrupted writes and can leak unencrypted data in temporary journals. AnoDrop uses a custom zero-dependency append-only WAL (`transactions.v1.enc`) protected by AES-256-GCM with positional AAD, atomic `::fsync`, and zero-downtime compaction via temporary atomic rename.
+> Traditional SQLite or flat files risk data corruption during interrupted writes and can leak unencrypted data in temporary journals. AnoDrop uses a custom zero-dependency append-only WAL (`transactions.v1.enc`) protected by AES-256-GCM with positional AAD, atomic `::fsync`, and zero-downtime compaction via temporary atomic rename. The master password derives a Key Encryption Key (KEK) via Argon2id to unwrap the DEK in `vault.enc`.
 
 ```mermaid
 sequenceDiagram
